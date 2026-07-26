@@ -210,21 +210,21 @@ async function assertCaretakerAccess(busNumber, auth) {
 
 async function initializeDatabase() {
     const bootstrap = await mysql.createConnection({
-        host: DB_HOST,
-        port: DB_PORT,
-        user: DB_USER,
-        password: DB_PASSWORD,
+        host: "127.0.0.1",
+        port: "3306",
+        user: "root",
+        password: "Ansh@2007",
     });
 
     await bootstrap.query(`CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\``);
     await bootstrap.end();
 
     pool = mysql.createPool({
-        host: DB_HOST,
-        port: DB_PORT,
-        user: DB_USER,
-        password: DB_PASSWORD,
-        database: DB_NAME,
+        host: "127.0.0.1",
+        port: "3306",
+        user: "root",
+        password: "Ansh@2007",
+        database: "campus_bus_tracker",
         connectionLimit: 10,
         waitForConnections: true,
     });
