@@ -1,0 +1,9 @@
+◇ injected env (8) from .env // tip: ⌘ suppress logs { quiet: true }
+Server running on port 8080
+MySQL: postgres@127.0.0.1:55432/campus_bus_tracker
+Seed logins:
+  Student: student@nitmz.ac.in / student123
+  Caretaker BH1: caretaker-bh1@nitmz.ac.in / caretaker123
+  Caretaker GH1: caretaker-gh1@nitmz.ac.in / caretaker123
+ESP32 secure endpoint: http://<YOUR_PC_IP>:8080/api/update-location
+Flutter latest endpoint: http://<YOUR_PC_IP>:8080/api/location/latest
