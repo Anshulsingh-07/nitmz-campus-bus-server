@@ -7,6 +7,9 @@ class BusLocation {
   final double speed;
   final double accuracy;
   final String status;
+  final int? etaSeconds;
+  final int? etaMeters;
+  final String? etaLabel;
   final DateTime timestamp;
 
   const BusLocation({
@@ -19,6 +22,9 @@ class BusLocation {
     required this.accuracy,
     required this.status,
     required this.timestamp,
+    this.etaSeconds,
+    this.etaMeters,
+    this.etaLabel,
   });
 
   factory BusLocation.fromJson(Map<String, dynamic> json) {
@@ -36,15 +42,31 @@ class BusLocation {
     }
 
     return BusLocation(
-      busId: (json['busId'] ?? json['bus_id'] ?? json['busNumber'] ?? 'Bus-1').toString(),
-      deviceId: (json['deviceId'] ?? json['device_id'] ?? 'device-1').toString(),
-      assignedHostel: (json['assignedHostel'] ?? json['assigned_hostel'] ?? '').toString(),
+      busId: (json['busId'] ?? json['bus_id'] ?? json['busNumber'] ?? 'Bus-1')
+          .toString(),
+      deviceId: (json['deviceId'] ?? json['device_id'] ?? 'device-1')
+          .toString(),
+      assignedHostel:
+          (json['assignedHostel'] ??
+                  json['assigned_hostel'] ??
+                  json['hostel'] ??
+                  '')
+              .toString(),
       lat: toDouble(json['lat'] ?? json['latitude'], 23.7271),
       lng: toDouble(json['lng'] ?? json['longitude'], 92.7176),
       speed: toDouble(json['speed'], 0),
       accuracy: toDouble(json['accuracy'] ?? json['hdop'], 1.0),
       status: (json['status'] ?? 'idle').toString(),
-      timestamp: parseTimestamp(json['timestamp'] ?? json['ts'] ?? json['received_at']),
+      timestamp: parseTimestamp(
+        json['timestamp'] ?? json['ts'] ?? json['received_at'],
+      ),
+      etaSeconds: (json['eta_seconds'] is num)
+          ? (json['eta_seconds'] as num).toInt()
+          : (json['eta'] is num ? (json['eta'] as num).toInt() : null),
+      etaMeters: (json['eta_meters'] is num) ? (json['eta_meters'] as num).toInt() : null,
+      etaLabel: (json['eta_label'] ?? json['eta_text'] ?? json['eta']) is String
+          ? (json['eta_label'] ?? json['eta_text'] ?? json['eta'])?.toString()
+          : null,
     );
   }
 

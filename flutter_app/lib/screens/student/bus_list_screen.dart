@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import '../../services/bus_service.dart';
 import '../../services/auth_service.dart';
 import '../../widgets/bus_card.dart';
+import 'map_screen.dart';
 
 class BusListScreen extends StatefulWidget {
   const BusListScreen({super.key});
@@ -30,7 +31,16 @@ class _BusListScreenState extends State<BusListScreen> {
     var buses = bus.getBusesByHostel(hostel);
 
     if (_searchQuery.isNotEmpty) {
-      buses = buses.where((b) => b.busNumber.toString().contains(_searchQuery) || (b.driver?.name.toLowerCase().contains(_searchQuery.toLowerCase()) ?? false)).toList();
+      buses = buses
+          .where(
+            (b) =>
+                b.busNumber.toString().contains(_searchQuery) ||
+                (b.driver?.name.toLowerCase().contains(
+                      _searchQuery.toLowerCase(),
+                    ) ??
+                    false),
+          )
+          .toList();
     }
     if (_filterStatus != 'all') {
       buses = buses.where((b) => b.status == _filterStatus).toList();
@@ -48,7 +58,10 @@ class _BusListScreenState extends State<BusListScreen> {
               const PopupMenuItem(value: 'all', child: Text('All Buses')),
               const PopupMenuItem(value: 'running', child: Text('Running')),
               const PopupMenuItem(value: 'idle', child: Text('Idle')),
-              const PopupMenuItem(value: 'maintenance', child: Text('Maintenance')),
+              const PopupMenuItem(
+                value: 'maintenance',
+                child: Text('Maintenance'),
+              ),
             ],
           ),
         ],
@@ -64,25 +77,65 @@ class _BusListScreenState extends State<BusListScreen> {
                 hintText: 'Search by bus number or driver...',
                 hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.7)),
                 prefixIcon: const Icon(Icons.search, color: Colors.white),
-                filled: true, fillColor: Colors.white.withValues(alpha: 0.2),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                suffixIcon: _searchQuery.isNotEmpty ? IconButton(icon: const Icon(Icons.clear, color: Colors.white), onPressed: () { _searchCtrl.clear(); setState(() => _searchQuery = ''); }) : null,
+                filled: true,
+                fillColor: Colors.white.withValues(alpha: 0.2),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
+                suffixIcon: _searchQuery.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.clear, color: Colors.white),
+                        onPressed: () {
+                          _searchCtrl.clear();
+                          setState(() => _searchQuery = '');
+                        },
+                      )
+                    : null,
               ),
             ),
           ),
         ),
       ),
       body: buses.isEmpty
-          ? Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-              const Icon(Icons.search_off, size: 64, color: Colors.grey),
-              const SizedBox(height: 12),
-              Text(_searchQuery.isNotEmpty ? 'No buses found for "$_searchQuery"' : 'No buses available', style: const TextStyle(color: Colors.grey, fontSize: 16)),
-            ]))
+          ? Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.search_off, size: 64, color: Colors.grey),
+                  const SizedBox(height: 12),
+                  Text(
+                    _searchQuery.isNotEmpty
+                        ? 'No buses found for "$_searchQuery"'
+                        : 'No buses available',
+                    style: const TextStyle(color: Colors.grey, fontSize: 16),
+                  ),
+                ],
+              ),
+            )
           : ListView.builder(
               padding: const EdgeInsets.all(16),
               itemCount: buses.length,
-              itemBuilder: (_, i) => Padding(padding: const EdgeInsets.only(bottom: 12), child: BusCard(bus: buses[i], compact: false, showDetails: true)),
+              itemBuilder: (_, i) => Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: BusCard(
+                  bus: buses[i],
+                  compact: false,
+                  showDetails: true,
+                  onStartRoute: buses[i].status == 'running'
+                      ? () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => MapScreen(selectedBus: buses[i]),
+                          ),
+                        )
+                      : null,
+                ),
+              ),
             ),
     );
   }

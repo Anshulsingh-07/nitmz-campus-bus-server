@@ -57,12 +57,32 @@ class _AdminHomeState extends State<AdminHome> {
         backgroundColor: Colors.white,
         elevation: 8,
         destinations: [
-          const NavigationDestination(icon: Icon(Icons.dashboard_outlined), selectedIcon: Icon(Icons.dashboard), label: 'Dashboard'),
-          const NavigationDestination(icon: Icon(Icons.directions_bus_outlined), selectedIcon: Icon(Icons.directions_bus), label: 'Buses'),
-          const NavigationDestination(icon: Icon(Icons.schedule_outlined), selectedIcon: Icon(Icons.schedule), label: 'Schedule'),
-          const NavigationDestination(icon: Icon(Icons.map_outlined), selectedIcon: Icon(Icons.map), label: 'Live Map'),
+          const NavigationDestination(
+            icon: Icon(Icons.dashboard_outlined),
+            selectedIcon: Icon(Icons.dashboard),
+            label: 'Dashboard',
+          ),
+          const NavigationDestination(
+            icon: Icon(Icons.directions_bus_outlined),
+            selectedIcon: Icon(Icons.directions_bus),
+            label: 'Buses',
+          ),
+          const NavigationDestination(
+            icon: Icon(Icons.schedule_outlined),
+            selectedIcon: Icon(Icons.schedule),
+            label: 'Schedule',
+          ),
+          const NavigationDestination(
+            icon: Icon(Icons.map_outlined),
+            selectedIcon: Icon(Icons.map),
+            label: 'Live Map',
+          ),
           NavigationDestination(
-            icon: Badge(isLabelVisible: notif.unreadCount > 0, label: Text('${notif.unreadCount}'), child: const Icon(Icons.notifications_outlined)),
+            icon: Badge(
+              isLabelVisible: notif.unreadCount > 0,
+              label: Text('${notif.unreadCount}'),
+              child: const Icon(Icons.notifications_outlined),
+            ),
             selectedIcon: const Icon(Icons.notifications),
             label: 'Alerts',
           ),

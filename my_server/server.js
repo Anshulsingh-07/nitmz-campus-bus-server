@@ -1,14 +1,16 @@
 const express = require('express');
 const crypto = require('crypto');
-const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
+const { Pool } = require('pg');
 require('dotenv').config();
 
 const app = express();
 const port = Number(process.env.PORT || 8080);
 const API_SECRET_KEY = process.env.API_SECRET_KEY || 'BUSTRACKESP1SECRETKEY';
+const DRIVER_JWT_SECRET = process.env.JWT_SECRET || API_SECRET_KEY;
 
 const DB_HOST = process.env.DB_HOST || '127.0.0.1';
-const DB_PORT = Number(process.env.DB_PORT || 3306);
+const DB_PORT = Number(process.env.DB_PORT || 5432);
 const DB_USER = process.env.DB_USER || 'root';
 const DB_PASSWORD = process.env.DB_PASSWORD || '';
 const DB_NAME = process.env.DB_NAME || 'campus_bus_tracker';
@@ -67,6 +69,8 @@ const notificationsSeed = [
 ];
 
 const sessions = new Map();
+const activeDriverSessions = new Map();
+const driverLoginFailures = new Map();
 
 const today = () => new Date().toISOString().slice(0, 10);
 const uid = (prefix) => `${prefix}${crypto.randomBytes(6).toString('hex')}`;
@@ -81,8 +85,11 @@ app.use((req, res, next) => {
 });
 
 async function q(sql, params = []) {
-    const [rows] = await pool.execute(sql, params);
-    return rows;
+    // convert '?' placeholders to $1, $2, ... for pg
+    let idx = 0;
+    const text = sql.replace(/\?/g, () => `$${++idx}`);
+    const res = await pool.query(text, params);
+    return res.rows;
 }
 
 function publicUser(row) {
@@ -118,6 +125,7 @@ function mapBus(row) {
         speed: Number(row.speed),
         isEnabled: !!row.is_enabled,
         route: row.route || 'Hostel ↔ MBSE',
+        lastUpdated: row.last_updated ? (row.last_updated.toISOString?.() ?? row.last_updated) : null,
         driver: row.driver_id
             ? {
                 _id: row.driver_id,
@@ -131,15 +139,47 @@ function mapBus(row) {
     };
 }
 
+function mapLiveBus(row) {
+    return {
+        busNumber: row.bus_number,
+        status: row.status,
+        lat: row.lat != null ? Number(row.lat) : Number(row.latitude),
+        lng: row.lng != null ? Number(row.lng) : Number(row.longitude),
+        speed: Number(row.speed || 0),
+        route: row.route || 'Hostel ↔ MBSE',
+        hostel: row.assigned_hostel,
+        hasFix: row.lat != null && row.lng != null,
+        satellites: row.satellites != null ? Number(row.satellites) : null,
+        hdop: row.hdop != null ? Number(row.hdop) : null,
+        netType: row.net_type || 'API',
+        lastUpdated: row.received_at || null,
+    };
+}
+
 function requireAuth(req, res, allowedRoles = null) {
     const header = req.header('authorization') || '';
     const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-    if (!token || !sessions.has(token)) {
+    if (!token || !sessions.has(token) || sessions.get(token).expiresAt < Date.now()) {
+        if (token && sessions.has(token)) sessions.delete(token);
         res.status(401).json({ error: 'Unauthorized' });
         return null;
     }
 
     const session = sessions.get(token);
+    if (session.role === 'driver') {
+        const parts = token.split('.');
+        if (parts.length !== 3) { res.status(401).json({ error: 'Unauthorized' }); return null; }
+        const signingInput = `${parts[0]}.${parts[1]}`;
+        const expected = crypto.createHmac('sha256', DRIVER_JWT_SECRET).update(signingInput).digest();
+        let actual;
+        try { actual = Buffer.from(parts[2], 'base64url'); } catch (_) { actual = Buffer.alloc(0); }
+        let claims;
+        try { claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')); } catch (_) { claims = null; }
+        if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected) || claims?.sub !== session.userId || claims?.role !== 'driver' || claims?.exp * 1000 < Date.now()) {
+            sessions.delete(token); activeDriverSessions.delete(session.userId);
+            res.status(401).json({ error: 'Unauthorized' }); return null;
+        }
+    }
     if (allowedRoles && !allowedRoles.includes(session.role)) {
         res.status(403).json({ error: 'Forbidden' });
         return null;
@@ -149,12 +189,24 @@ function requireAuth(req, res, allowedRoles = null) {
 }
 
 function createToken(user) {
-    const token = crypto.randomBytes(24).toString('hex');
+    const expiresAt = Date.now() + (user.role === 'driver' ? 12 : 24 * 30) * 60 * 60 * 1000;
+    let token;
+    if (user.role === 'driver') {
+        const base64url = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
+        const signingInput = `${base64url({ alg: 'HS256', typ: 'JWT' })}.${base64url({ sub: user.id, role: 'driver', name: user.name, phone: user.phone, busNumber: user.bus_number, exp: Math.floor(expiresAt / 1000) })}`;
+        const signature = crypto.createHmac('sha256', DRIVER_JWT_SECRET).update(signingInput).digest('base64url');
+        token = `${signingInput}.${signature}`;
+    } else {
+        token = crypto.randomBytes(24).toString('hex');
+    }
     sessions.set(token, {
         userId: user.id,
         email: user.email,
         role: user.role,
         hostelId: user.hostel_id,
+        phone: user.phone || null,
+        busNumber: user.bus_number || null,
+        expiresAt,
     });
     return token;
 }
@@ -169,6 +221,7 @@ SELECT
   b.speed,
   b.is_enabled,
   b.route,
+  live.last_updated,
   d.id AS driver_id,
   d.name AS driver_name,
   d.phone AS driver_phone,
@@ -181,6 +234,11 @@ SELECT
   s.updated_by
 FROM buses b
 LEFT JOIN drivers d ON d.bus_number = b.bus_number
+LEFT JOIN (
+  SELECT DISTINCT ON (bus_id) bus_id, received_at AS last_updated
+  FROM telemetry WHERE bus_id IS NOT NULL
+  ORDER BY bus_id, received_at DESC
+) live ON live.bus_id = CAST(b.bus_number AS TEXT)
 LEFT JOIN (
   SELECT s1.*
   FROM schedules s1
@@ -209,33 +267,35 @@ async function assertCaretakerAccess(busNumber, auth) {
 }
 
 async function initializeDatabase() {
-    const bootstrap = await mysql.createConnection({
-        host: "127.0.0.1",
-        port: "3306",
-        user: "root",
-        password: "Ansh@2007",
-    });
+    // Create a pg Pool connected to Supabase/Postgres
+    const poolConfig = process.env.DATABASE_URL
+        ? {
+            connectionString: process.env.DATABASE_URL,
+            ssl: { rejectUnauthorized: false },
+            max: 10,
+            idleTimeoutMillis: 30000,
+        }
+        : {
+            host: DB_HOST,
+            port: DB_PORT,
+            user: DB_USER,
+            password: DB_PASSWORD,
+            database: DB_NAME,
+            max: 10,
+            idleTimeoutMillis: 30000,
+            ssl: process.env.DB_SSL === 'true' || DB_HOST.includes('supabase') ? { rejectUnauthorized: false } : false,
+        };
+    pool = new Pool(poolConfig);
 
-    await bootstrap.query(`CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\``);
-    await bootstrap.end();
-
-    pool = mysql.createPool({
-        host: "127.0.0.1",
-        port: "3306",
-        user: "root",
-        password: "Ansh@2007",
-        database: "campus_bus_tracker",
-        connectionLimit: 10,
-        waitForConnections: true,
-    });
-
+    // Create tables (Postgres-compatible)
     await q(`
 CREATE TABLE IF NOT EXISTS hostels (
   id VARCHAR(10) PRIMARY KEY,
   name VARCHAR(20) NOT NULL,
   type VARCHAR(20) NOT NULL,
   full_name VARCHAR(100) NOT NULL
-)`);
+);
+`);
 
     await q(`
 CREATE TABLE IF NOT EXISTS users (
@@ -247,21 +307,23 @@ CREATE TABLE IF NOT EXISTS users (
   hostel_id VARCHAR(10) NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (hostel_id) REFERENCES hostels(id) ON DELETE SET NULL
-)`);
+);
+`);
 
     await q(`
 CREATE TABLE IF NOT EXISTS buses (
   bus_number INT PRIMARY KEY,
   assigned_hostel VARCHAR(10) NOT NULL,
   status VARCHAR(20) NOT NULL DEFAULT 'idle',
-  latitude DECIMAL(10,6) NOT NULL,
-  longitude DECIMAL(10,6) NOT NULL,
-  speed DECIMAL(8,2) NOT NULL DEFAULT 0,
-  is_enabled TINYINT(1) NOT NULL DEFAULT 1,
+  latitude NUMERIC(10,6) NOT NULL,
+  longitude NUMERIC(10,6) NOT NULL,
+  speed NUMERIC(8,2) NOT NULL DEFAULT 0,
+  is_enabled BOOLEAN NOT NULL DEFAULT true,
   route VARCHAR(120) NOT NULL DEFAULT 'Hostel ↔ MBSE',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (assigned_hostel) REFERENCES hostels(id)
-)`);
+);
+`);
 
     await q(`
 CREATE TABLE IF NOT EXISTS drivers (
@@ -269,9 +331,26 @@ CREATE TABLE IF NOT EXISTS drivers (
   bus_number INT NOT NULL UNIQUE,
   name VARCHAR(120) NOT NULL,
   phone VARCHAR(30) NOT NULL,
-  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  is_active BOOLEAN NOT NULL DEFAULT true,
   FOREIGN KEY (bus_number) REFERENCES buses(bus_number) ON DELETE CASCADE
-)`);
+);
+`);
+
+    await q(`
+CREATE TABLE IF NOT EXISTS driver_accounts (
+  id VARCHAR(40) PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  phone VARCHAR(10) NOT NULL UNIQUE,
+  pin_hash VARCHAR(100) NOT NULL,
+  bus_number INT NOT NULL REFERENCES buses(bus_number),
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',
+  failed_attempts INT NOT NULL DEFAULT 0,
+  locked_until TIMESTAMP NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  approved_at TIMESTAMP NULL
+);
+`);
+    await q("CREATE UNIQUE INDEX IF NOT EXISTS driver_accounts_approved_bus_unique ON driver_accounts (bus_number) WHERE status IN ('pending','approved')");
 
     await q(`
 CREATE TABLE IF NOT EXISTS schedules (
@@ -282,10 +361,11 @@ CREATE TABLE IF NOT EXISTS schedules (
   from_mbse_time VARCHAR(20) NOT NULL,
   special_note VARCHAR(255) NULL,
   updated_by VARCHAR(120) NULL,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  UNIQUE KEY uniq_schedule_bus_date (bus_number, date),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (bus_number, date),
   FOREIGN KEY (bus_number) REFERENCES buses(bus_number) ON DELETE CASCADE
-)`);
+);
+`);
 
     await q(`
 CREATE TABLE IF NOT EXISTS notifications (
@@ -296,29 +376,32 @@ CREATE TABLE IF NOT EXISTS notifications (
   bus_number INT NULL,
   target_hostel VARCHAR(10) NULL,
   sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  is_read TINYINT(1) NOT NULL DEFAULT 0,
+  is_read BOOLEAN NOT NULL DEFAULT false,
   sent_by VARCHAR(120) NULL,
   FOREIGN KEY (target_hostel) REFERENCES hostels(id) ON DELETE SET NULL
-)`);
+);
+`);
 
     await q(`
 CREATE TABLE IF NOT EXISTS telemetry (
-  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id SERIAL PRIMARY KEY,
   device_id VARCHAR(60) NULL,
   bus_id VARCHAR(40) NULL,
-  lat DECIMAL(10,6) NOT NULL,
-  lng DECIMAL(10,6) NOT NULL,
-  speed DECIMAL(8,2) NOT NULL DEFAULT 0,
-  accuracy DECIMAL(8,2) NOT NULL DEFAULT 1.0,
+  lat NUMERIC(10,6) NOT NULL,
+  lng NUMERIC(10,6) NOT NULL,
+  speed NUMERIC(8,2) NOT NULL DEFAULT 0,
+  accuracy NUMERIC(8,2) NOT NULL DEFAULT 1.0,
   ts VARCHAR(64) NULL,
   status VARCHAR(20) NOT NULL DEFAULT 'idle',
   received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)`);
+);
+`);
 
-    const [hostelCount] = await q('SELECT COUNT(*) AS count FROM hostels');
-    if (hostelCount.count === 0) {
+    const [hostelCountRow] = await q('SELECT COUNT(*) AS count FROM hostels');
+    const hostelCount = hostelCountRow ? Number(hostelCountRow.count) : 0;
+    if (hostelCount === 0) {
         for (const hostel of hostelsSeed) {
-            await q('INSERT INTO hostels (id, name, type, full_name) VALUES (?, ?, ?, ?)', [
+            await q('INSERT INTO hostels (id, name, type, full_name) VALUES ($1, $2, $3, $4)', [
                 hostel.id,
                 hostel.name,
                 hostel.type,
@@ -327,50 +410,55 @@ CREATE TABLE IF NOT EXISTS telemetry (
         }
     }
 
-    const [userCount] = await q('SELECT COUNT(*) AS count FROM users');
-    if (userCount.count === 0) {
+    const [userCountRow] = await q('SELECT COUNT(*) AS count FROM users');
+    const userCount = userCountRow ? Number(userCountRow.count) : 0;
+    if (userCount === 0) {
         for (const user of usersSeed) {
             await q(
-                'INSERT INTO users (id, name, email, password, role, hostel_id) VALUES (?, ?, ?, ?, ?, ?)',
+                'INSERT INTO users (id, name, email, password, role, hostel_id) VALUES ($1, $2, $3, $4, $5, $6)',
                 [user.id, user.name, user.email, user.password, user.role, user.hostelId]
             );
         }
     }
 
-    const [busCount] = await q('SELECT COUNT(*) AS count FROM buses');
-    if (busCount.count === 0) {
+    const [busCountRow] = await q('SELECT COUNT(*) AS count FROM buses');
+    const busCount = busCountRow ? Number(busCountRow.count) : 0;
+    if (busCount === 0) {
         for (const [busNumber, assignedHostel, driverName, phone, latitude, longitude, status, fromHostelTime, fromMBSETime, specialNote = ''] of busesSeed) {
             await q(
-                'INSERT INTO buses (bus_number, assigned_hostel, status, latitude, longitude, speed, is_enabled, route) VALUES (?, ?, ?, ?, ?, ?, 1, ?)',
-                [busNumber, assignedHostel, status, latitude, longitude, status === 'running' ? 25 : 0, 'Hostel ↔ MBSE']
+                'INSERT INTO buses (bus_number, assigned_hostel, status, latitude, longitude, speed, is_enabled, route) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+                [busNumber, assignedHostel, status, latitude, longitude, status === 'running' ? 25 : 0, true, 'Hostel ↔ MBSE']
             );
-            await q('INSERT INTO drivers (id, bus_number, name, phone, is_active) VALUES (?, ?, ?, ?, 1)', [
+            await q('INSERT INTO drivers (id, bus_number, name, phone, is_active) VALUES ($1, $2, $3, $4, $5)', [
                 `drv${busNumber}`,
                 busNumber,
                 driverName,
                 phone,
+                true,
             ]);
             await q(
-                'INSERT INTO schedules (id, bus_number, date, from_hostel_time, from_mbse_time, special_note, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                'INSERT INTO schedules (id, bus_number, date, from_hostel_time, from_mbse_time, special_note, updated_by) VALUES ($1, $2, $3, $4, $5, $6, $7)',
                 [`sch${busNumber}`, busNumber, today(), fromHostelTime, fromMBSETime, specialNote, 'caretaker-gh1@nitmz.ac.in']
             );
         }
     }
 
-    const [notifCount] = await q('SELECT COUNT(*) AS count FROM notifications');
-    if (notifCount.count === 0) {
+    const [notifCountRow] = await q('SELECT COUNT(*) AS count FROM notifications');
+    const notifCount = notifCountRow ? Number(notifCountRow.count) : 0;
+    if (notifCount === 0) {
         for (const [id, title, message, type, busNumber, targetHostel, isRead] of notificationsSeed) {
             await q(
-                'INSERT INTO notifications (id, title, message, type, bus_number, target_hostel, is_read, sent_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                [id, title, message, type, busNumber, targetHostel, isRead ? 1 : 0, 'seed']
+                'INSERT INTO notifications (id, title, message, type, bus_number, target_hostel, is_read, sent_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+                [id, title, message, type, busNumber, targetHostel, !!isRead, 'seed']
             );
         }
     }
 
-    const [telemetryCount] = await q('SELECT COUNT(*) AS count FROM telemetry');
-    if (telemetryCount.count === 0) {
+    const [telemetryCountRow] = await q('SELECT COUNT(*) AS count FROM telemetry');
+    const telemetryCount = telemetryCountRow ? Number(telemetryCountRow.count) : 0;
+    if (telemetryCount === 0) {
         await q(
-            'INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, ts, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, ts, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
             ['ESP32-1', '5', 23.7271, 92.7176, 0, 1.0, null, 'idle']
         );
     }
@@ -408,6 +496,9 @@ app.post('/api/auth/register', async (req, res) => {
         if (!name || !email || !password) {
             return res.status(400).json({ error: 'name, email, and password are required' });
         }
+        if (!String(email).toLowerCase().endsWith('@nitmz.ac.in')) {
+            return res.status(400).json({ error: 'Only @nitmz.ac.in emails are allowed' });
+        }
 
         const existing = await q('SELECT id FROM users WHERE email = ?', [email]);
         if (existing.length > 0) {
@@ -435,6 +526,201 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
+app.get('/api/auth/driver/buses', async (_req, res) => {
+    try {
+        const rows = await q(`SELECT b.bus_number AS "busNumber", b.route FROM buses b
+          LEFT JOIN drivers d ON d.bus_number=b.bus_number AND d.is_active=true
+          LEFT JOIN driver_accounts a ON a.bus_number=b.bus_number AND a.status IN ('pending','approved')
+          WHERE b.is_enabled=true AND d.id IS NULL AND a.id IS NULL ORDER BY b.bus_number`);
+        return res.json(rows);
+    } catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/auth/driver/register', async (req, res) => {
+    try {
+        const { name, phone, pin, busNumber } = req.body || {};
+        if (!String(name || '').trim() || !/^(?:\+?91)?[6-9]\d{9}$/.test(String(phone || '').replace(/[\s-]/g, '')) || !/^\d{6}$/.test(String(pin || '')) || !Number.isInteger(Number(busNumber)))
+            return res.status(400).json({ error: 'Enter a name, valid 10-digit Indian mobile number, six-digit PIN, and bus number' });
+        const normalizedPhone = String(phone).replace(/\D/g, '').slice(-10);
+        const bus = await q('SELECT bus_number FROM buses WHERE bus_number=? AND is_enabled=true', [Number(busNumber)]);
+        if (!bus.length) return res.status(404).json({ error: 'Bus not found' });
+        const existing = await q('SELECT id FROM driver_accounts WHERE phone=?', [normalizedPhone]);
+        if (existing.length) return res.status(409).json({ error: 'This mobile number is already registered' });
+        const claimed = await q(`SELECT id FROM drivers WHERE bus_number=? AND is_active=true
+          UNION ALL SELECT id FROM driver_accounts WHERE bus_number=? AND status IN ('pending','approved') LIMIT 1`, [Number(busNumber), Number(busNumber)]);
+        if (claimed.length) return res.status(409).json({ error: 'This bus already has an active or pending driver assignment. Ask an admin to unassign it first.' });
+        const id = uid('drv_');
+        const hash = await bcrypt.hash(String(pin), 12);
+        await q('INSERT INTO driver_accounts (id,name,phone,pin_hash,bus_number,status) VALUES (?,?,?,?,?,?)', [id, String(name).trim(), normalizedPhone, hash, Number(busNumber), 'pending']);
+        return res.status(201).json({ status: 'pending', message: 'Awaiting caretaker approval' });
+    } catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/auth/driver/login', async (req, res) => {
+    try {
+        const phone = String(req.body?.phone || '').replace(/\D/g, '').slice(-10);
+        const pin = String(req.body?.pin || '');
+        if (!/^[6-9]\d{9}$/.test(phone) || !/^\d{6}$/.test(pin)) return res.status(400).json({ error: 'Enter your 10-digit mobile number and six-digit PIN' });
+        const lock = driverLoginFailures.get(phone);
+        if (lock?.until > Date.now()) return res.status(429).json({ error: 'Too many failed attempts. Try again in 15 minutes.' });
+        const rows = await q('SELECT * FROM driver_accounts WHERE phone=? LIMIT 1', [phone]);
+        if (!rows.length || !(await bcrypt.compare(pin, rows[0].pin_hash))) {
+            const priorFailures = lock?.until && lock.until <= Date.now() ? 0 : (lock?.count || 0);
+            const failures = priorFailures + 1;
+            driverLoginFailures.set(phone, { count: failures, until: failures >= 5 ? Date.now() + 15 * 60 * 1000 : 0 });
+            return res.status(401).json({ error: 'Wrong mobile number or PIN' });
+        }
+        const driver = rows[0];
+        if (driver.status === 'pending') return res.status(403).json({ error: 'pending_approval', message: 'Your account is awaiting caretaker approval' });
+        if (driver.status === 'rejected') return res.status(403).json({ error: 'rejected', message: 'Your registration was rejected. Contact the caretaker for details.' });
+        if (driver.status !== 'approved') return res.status(403).json({ error: 'inactive_driver', message: 'This driver account is not active. Contact an administrator.' });
+        const activeToken = activeDriverSessions.get(driver.id);
+        if (activeToken && sessions.has(activeToken) && sessions.get(activeToken).expiresAt > Date.now()) return res.status(409).json({ error: 'This driver is already signed in on another device. Sign out there or contact an administrator.' });
+        driverLoginFailures.delete(phone);
+        const user = { id: driver.id, name: driver.name, phone, role: 'driver', bus_number: driver.bus_number };
+        const token = createToken(user);
+        activeDriverSessions.set(driver.id, token);
+        return res.json({ token, user: { id: driver.id, name: driver.name, phone, role: 'driver', busNumber: driver.bus_number } });
+    } catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+app.get('/api/admin/drivers/pending', async (req, res) => {
+    const auth = requireAuth(req, res, ['admin', 'caretaker']); if (!auth) return;
+    try { return res.json(await q(`SELECT id,name,phone,bus_number AS "busNumber",created_at AS "createdAt" FROM driver_accounts WHERE status='pending' ORDER BY created_at`)); }
+    catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+app.get('/api/admin/drivers/approved', async (req, res) => {
+    const auth = requireAuth(req, res, ['admin', 'caretaker']); if (!auth) return;
+    try { return res.json(await q(`SELECT id,name,phone,bus_number AS "busNumber",approved_at AS "createdAt" FROM driver_accounts WHERE status='approved' ORDER BY name`)); }
+    catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/admin/drivers/:id/approve', async (req, res) => {
+    const auth = requireAuth(req, res, ['admin', 'caretaker']); if (!auth) return;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const found = await client.query('SELECT * FROM driver_accounts WHERE id=$1 FOR UPDATE', [req.params.id]);
+        if (!found.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Driver not found' }); }
+        const driver = found.rows[0];
+        const conflict = await client.query("SELECT id FROM driver_accounts WHERE bus_number=$1 AND status='approved' AND id<>$2 FOR UPDATE", [driver.bus_number, driver.id]);
+        if (conflict.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'That bus is already assigned to another approved driver' }); }
+        const busExists = await client.query('SELECT bus_number FROM buses WHERE bus_number=$1 AND is_enabled=true', [driver.bus_number]);
+        if (!busExists.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Bus not found' }); }
+        await client.query('DELETE FROM drivers WHERE bus_number=$1', [driver.bus_number]);
+        await client.query('INSERT INTO drivers (id,bus_number,name,phone,is_active) VALUES ($1,$2,$3,$4,true) ON CONFLICT (bus_number) DO UPDATE SET id=EXCLUDED.id,name=EXCLUDED.name,phone=EXCLUDED.phone,is_active=true', [driver.id, driver.bus_number, driver.name, driver.phone]);
+        await client.query("UPDATE driver_accounts SET status='approved', approved_at=COALESCE(approved_at,CURRENT_TIMESTAMP) WHERE id=$1", [driver.id]);
+        await client.query('COMMIT');
+        return res.json({ status: 'approved' });
+    } catch (error) { await client.query('ROLLBACK'); return res.status(500).json({ error: error.message }); }
+    finally { client.release(); }
+});
+
+app.post('/api/admin/drivers/:id/reject', async (req, res) => {
+    const auth = requireAuth(req, res, ['admin', 'caretaker']); if (!auth) return;
+    try {
+        const rows = await q('UPDATE driver_accounts SET status=?, approved_at = NULL WHERE id=? RETURNING *', ['rejected', req.params.id]);
+        if (!rows.length) return res.status(404).json({ error: 'Driver not found' });
+        return res.json({ status: 'rejected' });
+    } catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+app.patch('/api/admin/drivers/:id', async (req, res) => {
+    const auth = requireAuth(req, res, ['admin', 'caretaker']); if (!auth) return;
+    const { action, busNumber } = req.body || {};
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const found = await client.query('SELECT * FROM driver_accounts WHERE id=$1 FOR UPDATE', [req.params.id]);
+        if (!found.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Driver not found' }); }
+        const driver = found.rows[0];
+        if (action === 'reject') await client.query("UPDATE driver_accounts SET status='rejected' WHERE id=$1", [driver.id]);
+        else if (action === 'remove') {
+            await client.query('DELETE FROM drivers WHERE bus_number=$1 AND id=$2', [driver.bus_number, driver.id]);
+            await client.query("UPDATE driver_accounts SET status='removed' WHERE id=$1", [driver.id]);
+            for (const [token, session] of sessions) if (session.userId === driver.id) sessions.delete(token);
+            activeDriverSessions.delete(driver.id);
+        } else if (action === 'approve' || action === 'reassign') {
+            const nextBus = Number(busNumber || driver.bus_number);
+            const conflict = await client.query("SELECT id FROM driver_accounts WHERE bus_number=$1 AND status='approved' AND id<>$2 FOR UPDATE", [nextBus, driver.id]);
+            if (conflict.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'That bus is already assigned to another approved driver' }); }
+            const busExists = await client.query('SELECT bus_number FROM buses WHERE bus_number=$1 AND is_enabled=true', [nextBus]);
+            const oldClaim = await client.query('SELECT id FROM drivers WHERE bus_number=$1 AND is_active=true AND id<>$2', [nextBus, driver.id]);
+            if (oldClaim.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Remove the current bus assignment before assigning this bus to another driver' }); }
+            if (!busExists.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Bus not found' }); }
+            await client.query('DELETE FROM drivers WHERE bus_number=$1', [driver.bus_number]);
+            await client.query('INSERT INTO drivers (id,bus_number,name,phone,is_active) VALUES ($1,$2,$3,$4,true) ON CONFLICT (bus_number) DO UPDATE SET id=EXCLUDED.id,name=EXCLUDED.name,phone=EXCLUDED.phone,is_active=true', [driver.id,nextBus,driver.name,driver.phone]);
+            await client.query("UPDATE driver_accounts SET bus_number=$1,status='approved',approved_at=COALESCE(approved_at,CURRENT_TIMESTAMP) WHERE id=$2", [nextBus,driver.id]);
+            for (const [token, session] of sessions) if (session.userId === driver.id) sessions.delete(token);
+            activeDriverSessions.delete(driver.id);
+        } else { await client.query('ROLLBACK'); return res.status(400).json({ error: 'action must be approve, reject, reassign, or remove' }); }
+        await client.query('COMMIT'); return res.json({ status: action });
+    } catch (error) { await client.query('ROLLBACK'); return res.status(500).json({ error: error.message }); }
+    finally { client.release(); }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    const auth = requireAuth(req, res); if (!auth) return;
+    sessions.delete(auth.token); if (auth.role === 'driver') activeDriverSessions.delete(auth.userId);
+    return res.json({ status: 'success' });
+});
+
+app.get('/api/buses/live', async (req, res) => {
+    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin']);
+    if (!auth) return;
+
+    try {
+        const hostel = auth.role === 'student' ? auth.hostelId : (req.query.hostel || null);
+        const where = hostel ? 'WHERE b.assigned_hostel = ?' : '';
+        const rows = await q(
+            `
+            SELECT
+                b.bus_number,
+                b.assigned_hostel,
+                b.status,
+                b.latitude,
+                b.longitude,
+                b.speed,
+                b.route,
+                t.lat,
+                t.lng,
+                t.accuracy AS hdop,
+                t.status AS telemetry_status,
+                t.received_at,
+                NULL AS satellites,
+                'API' AS net_type
+            FROM buses b
+            LEFT JOIN (
+                SELECT DISTINCT ON (bus_id)
+                    bus_id,
+                    lat,
+                    lng,
+                    accuracy,
+                    status,
+                    received_at
+                FROM telemetry
+                WHERE bus_id IS NOT NULL
+                ORDER BY bus_id, received_at DESC
+            ) t ON t.bus_id = CAST(b.bus_number AS TEXT)
+            ${where}
+            ORDER BY b.bus_number
+            `,
+            hostel ? [hostel] : []
+        );
+
+        return res.json({
+            status: 'success',
+            data: rows.map((row) => ({
+                ...mapLiveBus(row),
+                status: row.telemetry_status || row.status,
+            })),
+        });
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+});
+
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body || {};
@@ -456,6 +742,11 @@ app.get('/api/me', async (req, res) => {
     if (!auth) return;
 
     try {
+        if (auth.role === 'driver') {
+            const drivers = await q("SELECT id,name,phone,bus_number AS \"busNumber\",'driver' AS role FROM driver_accounts WHERE id=? AND status='approved' LIMIT 1", [auth.userId]);
+            if (!drivers.length) return res.status(404).json({ error: 'Driver account not found' });
+            return res.json({ status: 'success', user: drivers[0] });
+        }
         const rows = await q('SELECT id, name, email, role, hostel_id FROM users WHERE id = ? LIMIT 1', [auth.userId]);
         if (rows.length === 0) return res.status(404).json({ error: 'User not found' });
         return res.json({ status: 'success', user: publicUser(rows[0]) });
@@ -624,21 +915,21 @@ app.get('/api/schedules', async (req, res) => {
 
         const rows = await q(
             `
-      SELECT
-        s.id AS _id,
-        s.bus_number AS busNumber,
-        DATE_FORMAT(s.date, '%Y-%m-%d') AS date,
-        s.from_hostel_time AS fromHostelTime,
-        s.from_mbse_time AS fromMBSETime,
-        IFNULL(s.special_note, '') AS specialNote,
-        IFNULL(s.updated_by, '') AS updatedBy
-      FROM schedules s
-      JOIN buses b ON b.bus_number = s.bus_number
-      WHERE (? IS NULL OR b.assigned_hostel = ?)
-        AND (? IS NULL OR s.date = ?)
-      ORDER BY s.bus_number
+            SELECT
+                s.id AS _id,
+                s.bus_number AS busNumber,
+                to_char(s.date, 'YYYY-MM-DD') AS date,
+                s.from_hostel_time AS fromHostelTime,
+                s.from_mbse_time AS fromMBSETime,
+                COALESCE(s.special_note, '') AS specialNote,
+                COALESCE(s.updated_by, '') AS updatedBy
+            FROM schedules s
+            JOIN buses b ON b.bus_number = s.bus_number
+            WHERE ($1::varchar IS NULL OR b.assigned_hostel = $1::varchar)
+                AND ($2::date IS NULL OR s.date = $2::date)
+            ORDER BY s.bus_number
       `,
-            [hostel, hostel, date, date]
+                        [hostel, date]
         );
 
         return res.json(rows);
@@ -667,26 +958,27 @@ app.post('/api/schedules', async (req, res) => {
         const fromMBSETime = req.body.fromMBSETime || '';
         const specialNote = req.body.specialNote || '';
 
-        await q(
-            `
-      INSERT INTO schedules (id, bus_number, date, from_hostel_time, from_mbse_time, special_note, updated_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        from_hostel_time = VALUES(from_hostel_time),
-        from_mbse_time = VALUES(from_mbse_time),
-        special_note = VALUES(special_note),
-        updated_by = VALUES(updated_by)
-      `,
-            [
-                uid('sch_'),
-                busNumber,
-                scheduleDate,
-                fromHostelTime,
-                fromMBSETime,
-                specialNote,
-                auth.email,
-            ]
-        );
+                await q(
+                        `
+            INSERT INTO schedules (id, bus_number, date, from_hostel_time, from_mbse_time, special_note, updated_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (bus_number, date) DO UPDATE SET
+                from_hostel_time = EXCLUDED.from_hostel_time,
+                from_mbse_time = EXCLUDED.from_mbse_time,
+                special_note = EXCLUDED.special_note,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = CURRENT_TIMESTAMP
+            `,
+                        [
+                                uid('sch_'),
+                                busNumber,
+                                scheduleDate,
+                                fromHostelTime,
+                                fromMBSETime,
+                                specialNote,
+                                auth.email,
+                        ]
+                );
 
         if (req.body.status) {
             const status = String(req.body.status).toLowerCase();
@@ -697,22 +989,22 @@ app.post('/api/schedules', async (req, res) => {
             ]);
         }
 
-        const rows = await q(
-            `
-      SELECT
-        s.id AS _id,
-        s.bus_number AS busNumber,
-        DATE_FORMAT(s.date, '%Y-%m-%d') AS date,
-        s.from_hostel_time AS fromHostelTime,
-        s.from_mbse_time AS fromMBSETime,
-        IFNULL(s.special_note, '') AS specialNote,
-        IFNULL(s.updated_by, '') AS updatedBy
-      FROM schedules s
-      WHERE s.bus_number = ? AND s.date = ?
-      LIMIT 1
-      `,
-            [busNumber, scheduleDate]
-        );
+                const rows = await q(
+                        `
+            SELECT
+                s.id AS _id,
+                s.bus_number AS busNumber,
+                to_char(s.date, 'YYYY-MM-DD') AS date,
+                s.from_hostel_time AS fromHostelTime,
+                s.from_mbse_time AS fromMBSETime,
+                COALESCE(s.special_note, '') AS specialNote,
+                COALESCE(s.updated_by, '') AS updatedBy
+            FROM schedules s
+            WHERE s.bus_number = ? AND s.date = ?
+            LIMIT 1
+            `,
+                        [busNumber, scheduleDate]
+                );
 
         const bus = await fetchBusByNumber(busNumber);
         return res.json({ status: 'success', data: rows[0], bus });
@@ -773,20 +1065,20 @@ app.get('/api/notifications', async (req, res) => {
         const hostel = auth.role === 'student' ? auth.hostelId : (req.query.hostel || null);
         const rows = await q(
             `
-      SELECT
-        id AS _id,
-        title,
-        message,
-        type,
-        bus_number AS busNumber,
-        target_hostel AS targetHostel,
-        DATE_FORMAT(sent_at, '%Y-%m-%dT%H:%i:%sZ') AS sentAt,
-        is_read AS isRead
-      FROM notifications
-      WHERE (? IS NULL OR target_hostel = ? OR target_hostel IS NULL)
-      ORDER BY sent_at DESC
+            SELECT
+                id AS _id,
+                title,
+                message,
+                type,
+                bus_number AS busNumber,
+                target_hostel AS targetHostel,
+                to_char(sent_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS sentAt,
+                is_read AS isRead
+            FROM notifications
+            WHERE ($1 IS NULL OR target_hostel = $1 OR target_hostel IS NULL)
+            ORDER BY sent_at DESC
       `,
-            [hostel, hostel]
+                        [hostel]
         );
         return res.json(rows.map((n) => ({ ...n, isRead: !!n.isRead })));
     } catch (error) {
@@ -817,29 +1109,45 @@ app.post('/api/notifications/send', async (req, res) => {
             [id, title, message, type, busNumber, targetHostel, auth.email]
         );
 
-        const rows = await q(
-            `
-      SELECT
-        id AS _id,
-        title,
-        message,
-        type,
-        bus_number AS busNumber,
-        target_hostel AS targetHostel,
-        DATE_FORMAT(sent_at, '%Y-%m-%dT%H:%i:%sZ') AS sentAt,
-        is_read AS isRead
-      FROM notifications
-      WHERE id = ?
-      LIMIT 1
-      `,
-            [id]
-        );
+                const rows = await q(
+                        `
+            SELECT
+                id AS _id,
+                title,
+                message,
+                type,
+                bus_number AS busNumber,
+                target_hostel AS targetHostel,
+                to_char(sent_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS sentAt,
+                is_read AS isRead
+            FROM notifications
+            WHERE id = $1
+            LIMIT 1
+            `,
+                        [id]
+                );
 
         const created = rows[0];
         return res.json({ ...created, isRead: !!created.isRead });
     } catch (error) {
         return res.status(500).json({ error: error.message });
     }
+});
+
+app.post('/api/location', async (req, res) => {
+    const auth = requireAuth(req, res, ['driver']); if (!auth) return;
+    try {
+        const driverRows = await q("SELECT bus_number FROM driver_accounts WHERE id=? AND status='approved'", [auth.userId]);
+        if (!driverRows.length) return res.status(403).json({ error: 'No active bus assignment' });
+        const assignedBus = Number(driverRows[0].bus_number);
+        if (Number(req.body?.busNumber) !== assignedBus) return res.status(403).json({ error: 'Drivers can only publish location for their assigned bus' });
+        const { lat, lng, speed=0, heading=0, accuracy=0, status='idle', timestamp=null } = req.body || {};
+        if (![lat,lng,speed,heading,accuracy].every(v => Number.isFinite(Number(v))) || Number(accuracy) > 50) return res.status(400).json({ error: 'A valid GPS fix with accuracy of 50m or better is required' });
+        const safeStatus = Number(speed) < 1.5 ? 'idle' : (status === 'running' ? 'running' : 'idle');
+        await q('INSERT INTO telemetry (device_id,bus_id,lat,lng,speed,accuracy,ts,status) VALUES (NULL,?,?,?,?,?,?,?)', [String(assignedBus),Number(lat),Number(lng),Number(speed),Number(accuracy),timestamp || new Date().toISOString(),safeStatus]);
+        await q('UPDATE buses SET latitude=?,longitude=?,speed=?,status=? WHERE bus_number=?', [Number(lat),Number(lng),Number(speed),safeStatus,assignedBus]);
+        return res.json({ status: 'success' });
+    } catch (error) { return res.status(500).json({ error: error.message }); }
 });
 
 app.post('/api/update-location', async (req, res) => {
@@ -859,13 +1167,17 @@ app.post('/api/update-location', async (req, res) => {
         const speedNum = Number(speed || 0);
         const accuracyNum = Number(accuracy || 1.0);
         const normalizedStatus = status || 'idle';
+        const busNumber = Number(String(bus_id || '').replace(/[^0-9]/g, ''));
+        if (!Number.isNaN(busNumber) && busNumber > 0) {
+            const phoneDriver = await q("SELECT id FROM driver_accounts WHERE bus_number=? AND status='approved' LIMIT 1", [busNumber]);
+            if (phoneDriver.length) return res.status(403).json({ error: 'This bus location is published by its assigned driver phone' });
+        }
 
         await q(
             'INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, ts, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [device_id || null, bus_id?.toString() || null, latNum, lngNum, speedNum, accuracyNum, ts || null, normalizedStatus]
         );
 
-        const busNumber = Number(String(bus_id || '').replace(/[^0-9]/g, ''));
         if (!Number.isNaN(busNumber) && busNumber > 0) {
             await q(
                 'UPDATE buses SET latitude = ?, longitude = ?, speed = ?, status = ? WHERE bus_number = ?',
@@ -881,23 +1193,23 @@ app.post('/api/update-location', async (req, res) => {
 
 app.get('/api/location/latest', async (_req, res) => {
     try {
-        const rows = await q(
+                const rows = await q(
+                        `
+            SELECT
+                device_id,
+                bus_id,
+                lat,
+                lng,
+                speed,
+                accuracy,
+                ts,
+                status,
+                to_char(received_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS received_at
+            FROM telemetry
+            ORDER BY received_at DESC
+            LIMIT 1
             `
-      SELECT
-        device_id,
-        bus_id,
-        lat,
-        lng,
-        speed,
-        accuracy,
-        ts,
-        status,
-        DATE_FORMAT(received_at, '%Y-%m-%dT%H:%i:%sZ') AS received_at
-      FROM telemetry
-      ORDER BY received_at DESC
-      LIMIT 1
-      `
-        );
+                );
 
         if (!rows.length) {
             return res.json({
@@ -958,16 +1270,16 @@ app.post('/update-gps', async (req, res) => {
 
 app.get('/get-location', async (_req, res) => {
     try {
-        const rows = await q(
+                const rows = await q(
+                        `
+            SELECT lat, lng, to_char(received_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS received_at
+            FROM telemetry
+            ORDER BY received_at DESC
+            LIMIT 1
             `
-      SELECT lat, lng, DATE_FORMAT(received_at, '%Y-%m-%dT%H:%i:%sZ') AS received_at
-      FROM telemetry
-      ORDER BY received_at DESC
-      LIMIT 1
-      `
-        );
+                );
 
-        const latest = rows[0] || { lat: 23.7271, lng: 92.7176, received_at: new Date().toISOString() };
+                const latest = rows[0] || { lat: 23.7271, lng: 92.7176, received_at: new Date().toISOString() };
         return res.json({ latitude: Number(latest.lat), longitude: Number(latest.lng), timestamp: latest.received_at });
     } catch (error) {
         return res.status(500).json({ status: 'Error', message: error.message });

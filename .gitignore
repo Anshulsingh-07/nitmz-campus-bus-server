@@ -13,4 +13,16 @@
 .externalNativeBuild
 .cxx
 local.properties
+node_modules/
 node_models
+.env.prod
+.env
+*.env
+*.log
+exports/
+*.tar
+*.zip
+
+
+
+

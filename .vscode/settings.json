@@ -1,3 +1,4 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:system"
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "cmake.sourceDirectory": "/home/anshul/BT24CS034/myprojects/campus bus tracker trial version/flutter_app/linux"
 }
