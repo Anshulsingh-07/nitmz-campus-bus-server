@@ -1,13 +1,19 @@
 const express = require('express');
 const crypto = require('crypto');
-const bcrypt = require('bcrypt');
+const EventEmitter = require('events');
+const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 require('dotenv').config();
 
+if (process.env.NODE_ENV === 'production' && !process.env.API_SECRET_KEY) {
+    throw new Error('API_SECRET_KEY must be configured in production');
+}
+
 const app = express();
+const telemetryEmitter = new EventEmitter();
+telemetryEmitter.setMaxListeners(0);
 const port = Number(process.env.PORT || 8080);
 const API_SECRET_KEY = process.env.API_SECRET_KEY || 'BUSTRACKESP1SECRETKEY';
-const DRIVER_JWT_SECRET = process.env.JWT_SECRET || API_SECRET_KEY;
 
 const DB_HOST = process.env.DB_HOST || '127.0.0.1';
 const DB_PORT = Number(process.env.DB_PORT || 5432);
@@ -69,8 +75,8 @@ const notificationsSeed = [
 ];
 
 const sessions = new Map();
-const activeDriverSessions = new Map();
 const driverLoginFailures = new Map();
+const driverLastFixes = new Map();
 
 const today = () => new Date().toISOString().slice(0, 10);
 const uid = (prefix) => `${prefix}${crypto.randomBytes(6).toString('hex')}`;
@@ -148,12 +154,48 @@ function mapLiveBus(row) {
         speed: Number(row.speed || 0),
         route: row.route || 'Hostel ↔ MBSE',
         hostel: row.assigned_hostel,
-        hasFix: row.lat != null && row.lng != null,
+        hasFix: row.has_fix ?? (row.lat != null && row.lng != null),
         satellites: row.satellites != null ? Number(row.satellites) : null,
         hdop: row.hdop != null ? Number(row.hdop) : null,
         netType: row.net_type || 'API',
         lastUpdated: row.received_at || null,
     };
+}
+
+function normalizeTelemetry(body = {}) {
+    const rawBusId = body.bus_id ?? body.bus_number ?? body.busId ?? body.busNo ?? body.bus ?? null;
+    return {
+        deviceId: body.device_id || body.deviceId || null,
+        busId: rawBusId === null ? null : String(rawBusId),
+        lat: Number(body.lat ?? body.latitude ?? body.lat_deg),
+        lng: Number(body.lng ?? body.longitude ?? body.lng_deg ?? body.long),
+        speed: Number(body.speed ?? body.speed_kmh ?? body.spd ?? 0),
+        accuracy: Number(body.accuracy ?? body.hdop ?? 1),
+        hasFix: body.has_fix ?? null,
+        satellites: Number(body.satellites ?? 0),
+        hdop: Number(body.hdop ?? body.accuracy ?? 99.9),
+        netType: body.net_type || body.netType || 'unknown',
+        timestamp: body.ts ?? body.timestamp ?? null,
+        status: body.status || 'idle',
+    };
+}
+
+function haversineKm(a, b) {
+    const radians = (degrees) => degrees * Math.PI / 180;
+    const dLat = radians(b.lat - a.lat);
+    const dLng = radians(b.lng - a.lng);
+    const value = Math.sin(dLat / 2) ** 2 + Math.cos(radians(a.lat)) * Math.cos(radians(b.lat)) * Math.sin(dLng / 2) ** 2;
+    return 6371 * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
+}
+
+function bearingDegrees(a, b) {
+    const radians = (degrees) => degrees * Math.PI / 180;
+    const lat1 = radians(a.lat);
+    const lat2 = radians(b.lat);
+    const lngDelta = radians(b.lng - a.lng);
+    const y = Math.sin(lngDelta) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(lngDelta);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 }
 
 function requireAuth(req, res, allowedRoles = null) {
@@ -166,20 +208,6 @@ function requireAuth(req, res, allowedRoles = null) {
     }
 
     const session = sessions.get(token);
-    if (session.role === 'driver') {
-        const parts = token.split('.');
-        if (parts.length !== 3) { res.status(401).json({ error: 'Unauthorized' }); return null; }
-        const signingInput = `${parts[0]}.${parts[1]}`;
-        const expected = crypto.createHmac('sha256', DRIVER_JWT_SECRET).update(signingInput).digest();
-        let actual;
-        try { actual = Buffer.from(parts[2], 'base64url'); } catch (_) { actual = Buffer.alloc(0); }
-        let claims;
-        try { claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')); } catch (_) { claims = null; }
-        if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected) || claims?.sub !== session.userId || claims?.role !== 'driver' || claims?.exp * 1000 < Date.now()) {
-            sessions.delete(token); activeDriverSessions.delete(session.userId);
-            res.status(401).json({ error: 'Unauthorized' }); return null;
-        }
-    }
     if (allowedRoles && !allowedRoles.includes(session.role)) {
         res.status(403).json({ error: 'Forbidden' });
         return null;
@@ -189,23 +217,15 @@ function requireAuth(req, res, allowedRoles = null) {
 }
 
 function createToken(user) {
-    const expiresAt = Date.now() + (user.role === 'driver' ? 12 : 24 * 30) * 60 * 60 * 1000;
-    let token;
-    if (user.role === 'driver') {
-        const base64url = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
-        const signingInput = `${base64url({ alg: 'HS256', typ: 'JWT' })}.${base64url({ sub: user.id, role: 'driver', name: user.name, phone: user.phone, busNumber: user.bus_number, exp: Math.floor(expiresAt / 1000) })}`;
-        const signature = crypto.createHmac('sha256', DRIVER_JWT_SECRET).update(signingInput).digest('base64url');
-        token = `${signingInput}.${signature}`;
-    } else {
-        token = crypto.randomBytes(24).toString('hex');
-    }
+    const expiresAt = Date.now() + 24 * 30 * 60 * 60 * 1000;
+    const token = crypto.randomBytes(24).toString('hex');
     sessions.set(token, {
         userId: user.id,
         email: user.email,
         role: user.role,
         hostelId: user.hostel_id,
-        phone: user.phone || null,
-        busNumber: user.bus_number || null,
+        phone: user.phone,
+        busNumber: user.bus_number,
         expiresAt,
     });
     return token;
@@ -233,7 +253,7 @@ SELECT
   s.special_note,
   s.updated_by
 FROM buses b
-LEFT JOIN drivers d ON d.bus_number = b.bus_number
+LEFT JOIN drivers d ON d.bus_number = b.bus_number AND d.is_active = true
 LEFT JOIN (
   SELECT DISTINCT ON (bus_id) bus_id, received_at AS last_updated
   FROM telemetry WHERE bus_id IS NOT NULL
@@ -272,7 +292,7 @@ async function initializeDatabase() {
         ? {
             connectionString: process.env.DATABASE_URL,
             ssl: { rejectUnauthorized: false },
-            max: 10,
+            max: Number(process.env.PG_POOL_MAX || 20),
             idleTimeoutMillis: 30000,
         }
         : {
@@ -281,7 +301,7 @@ async function initializeDatabase() {
             user: DB_USER,
             password: DB_PASSWORD,
             database: DB_NAME,
-            max: 10,
+            max: Number(process.env.PG_POOL_MAX || 20),
             idleTimeoutMillis: 30000,
             ssl: process.env.DB_SSL === 'true' || DB_HOST.includes('supabase') ? { rejectUnauthorized: false } : false,
         };
@@ -329,44 +349,15 @@ CREATE TABLE IF NOT EXISTS buses (
 CREATE TABLE IF NOT EXISTS drivers (
   id VARCHAR(40) PRIMARY KEY,
   bus_number INT NOT NULL UNIQUE,
-  name VARCHAR(120) NOT NULL,
-  phone VARCHAR(30) NOT NULL,
+    name VARCHAR(120) NULL,
+  phone VARCHAR(30) NULL,
+  pin_hash VARCHAR(100) NULL,
   is_active BOOLEAN NOT NULL DEFAULT true,
   FOREIGN KEY (bus_number) REFERENCES buses(bus_number) ON DELETE CASCADE
 );
 `);
-
-    await q(`
-CREATE TABLE IF NOT EXISTS driver_accounts (
-  id VARCHAR(40) PRIMARY KEY,
-  name VARCHAR(120) NOT NULL,
-  phone VARCHAR(10) NOT NULL UNIQUE,
-  pin_hash VARCHAR(100) NOT NULL,
-  bus_number INT NOT NULL REFERENCES buses(bus_number),
-  status VARCHAR(20) NOT NULL DEFAULT 'pending',
-  failed_attempts INT NOT NULL DEFAULT 0,
-  locked_until TIMESTAMP NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  approved_at TIMESTAMP NULL
-);
-`);
-    await q("CREATE UNIQUE INDEX IF NOT EXISTS driver_accounts_approved_bus_unique ON driver_accounts (bus_number) WHERE status IN ('pending','approved')");
-
-    await q(`
-CREATE TABLE IF NOT EXISTS schedules (
-  id VARCHAR(40) PRIMARY KEY,
-  bus_number INT NOT NULL,
-  date DATE NOT NULL,
-  from_hostel_time VARCHAR(20) NOT NULL,
-  from_mbse_time VARCHAR(20) NOT NULL,
-  special_note VARCHAR(255) NULL,
-  updated_by VARCHAR(120) NULL,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (bus_number, date),
-  FOREIGN KEY (bus_number) REFERENCES buses(bus_number) ON DELETE CASCADE
-);
-`);
-
+    await q('ALTER TABLE drivers ADD COLUMN IF NOT EXISTS pin_hash VARCHAR(100) NULL');
+    await q('DROP INDEX IF EXISTS drivers_active_phone_unique');
     await q(`
 CREATE TABLE IF NOT EXISTS notifications (
   id VARCHAR(40) PRIMARY KEY,
@@ -391,11 +382,17 @@ CREATE TABLE IF NOT EXISTS telemetry (
   lng NUMERIC(10,6) NOT NULL,
   speed NUMERIC(8,2) NOT NULL DEFAULT 0,
   accuracy NUMERIC(8,2) NOT NULL DEFAULT 1.0,
+  heading NUMERIC(6,2) NOT NULL DEFAULT 0,
   ts VARCHAR(64) NULL,
   status VARCHAR(20) NOT NULL DEFAULT 'idle',
   received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 `);
+    await q('ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS has_fix BOOLEAN DEFAULT false');
+    await q('ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS satellites INT DEFAULT 0');
+    await q('ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS hdop NUMERIC(6,2) DEFAULT 99.9');
+    await q("ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS net_type VARCHAR(20) DEFAULT 'unknown'");
+    await q('ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS heading NUMERIC(6,2) NOT NULL DEFAULT 0');
 
     const [hostelCountRow] = await q('SELECT COUNT(*) AS count FROM hostels');
     const hostelCount = hostelCountRow ? Number(hostelCountRow.count) : 0;
@@ -465,7 +462,7 @@ CREATE TABLE IF NOT EXISTS telemetry (
 }
 
 app.get('/', (_req, res) => {
-    res.json({ status: 'ok', message: 'Campus Bus Tracker API running (MySQL)' });
+    res.json({ status: 'ok', message: 'Campus Bus Tracker API running (PostgreSQL)' });
 });
 
 app.get('/api/health', async (_req, res) => {
@@ -526,143 +523,9 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
-app.get('/api/auth/driver/buses', async (_req, res) => {
-    try {
-        const rows = await q(`SELECT b.bus_number AS "busNumber", b.route FROM buses b
-          LEFT JOIN drivers d ON d.bus_number=b.bus_number AND d.is_active=true
-          LEFT JOIN driver_accounts a ON a.bus_number=b.bus_number AND a.status IN ('pending','approved')
-          WHERE b.is_enabled=true AND d.id IS NULL AND a.id IS NULL ORDER BY b.bus_number`);
-        return res.json(rows);
-    } catch (error) { return res.status(500).json({ error: error.message }); }
-});
-
-app.post('/api/auth/driver/register', async (req, res) => {
-    try {
-        const { name, phone, pin, busNumber } = req.body || {};
-        if (!String(name || '').trim() || !/^(?:\+?91)?[6-9]\d{9}$/.test(String(phone || '').replace(/[\s-]/g, '')) || !/^\d{6}$/.test(String(pin || '')) || !Number.isInteger(Number(busNumber)))
-            return res.status(400).json({ error: 'Enter a name, valid 10-digit Indian mobile number, six-digit PIN, and bus number' });
-        const normalizedPhone = String(phone).replace(/\D/g, '').slice(-10);
-        const bus = await q('SELECT bus_number FROM buses WHERE bus_number=? AND is_enabled=true', [Number(busNumber)]);
-        if (!bus.length) return res.status(404).json({ error: 'Bus not found' });
-        const existing = await q('SELECT id FROM driver_accounts WHERE phone=?', [normalizedPhone]);
-        if (existing.length) return res.status(409).json({ error: 'This mobile number is already registered' });
-        const claimed = await q(`SELECT id FROM drivers WHERE bus_number=? AND is_active=true
-          UNION ALL SELECT id FROM driver_accounts WHERE bus_number=? AND status IN ('pending','approved') LIMIT 1`, [Number(busNumber), Number(busNumber)]);
-        if (claimed.length) return res.status(409).json({ error: 'This bus already has an active or pending driver assignment. Ask an admin to unassign it first.' });
-        const id = uid('drv_');
-        const hash = await bcrypt.hash(String(pin), 12);
-        await q('INSERT INTO driver_accounts (id,name,phone,pin_hash,bus_number,status) VALUES (?,?,?,?,?,?)', [id, String(name).trim(), normalizedPhone, hash, Number(busNumber), 'pending']);
-        return res.status(201).json({ status: 'pending', message: 'Awaiting caretaker approval' });
-    } catch (error) { return res.status(500).json({ error: error.message }); }
-});
-
-app.post('/api/auth/driver/login', async (req, res) => {
-    try {
-        const phone = String(req.body?.phone || '').replace(/\D/g, '').slice(-10);
-        const pin = String(req.body?.pin || '');
-        if (!/^[6-9]\d{9}$/.test(phone) || !/^\d{6}$/.test(pin)) return res.status(400).json({ error: 'Enter your 10-digit mobile number and six-digit PIN' });
-        const lock = driverLoginFailures.get(phone);
-        if (lock?.until > Date.now()) return res.status(429).json({ error: 'Too many failed attempts. Try again in 15 minutes.' });
-        const rows = await q('SELECT * FROM driver_accounts WHERE phone=? LIMIT 1', [phone]);
-        if (!rows.length || !(await bcrypt.compare(pin, rows[0].pin_hash))) {
-            const priorFailures = lock?.until && lock.until <= Date.now() ? 0 : (lock?.count || 0);
-            const failures = priorFailures + 1;
-            driverLoginFailures.set(phone, { count: failures, until: failures >= 5 ? Date.now() + 15 * 60 * 1000 : 0 });
-            return res.status(401).json({ error: 'Wrong mobile number or PIN' });
-        }
-        const driver = rows[0];
-        if (driver.status === 'pending') return res.status(403).json({ error: 'pending_approval', message: 'Your account is awaiting caretaker approval' });
-        if (driver.status === 'rejected') return res.status(403).json({ error: 'rejected', message: 'Your registration was rejected. Contact the caretaker for details.' });
-        if (driver.status !== 'approved') return res.status(403).json({ error: 'inactive_driver', message: 'This driver account is not active. Contact an administrator.' });
-        const activeToken = activeDriverSessions.get(driver.id);
-        if (activeToken && sessions.has(activeToken) && sessions.get(activeToken).expiresAt > Date.now()) return res.status(409).json({ error: 'This driver is already signed in on another device. Sign out there or contact an administrator.' });
-        driverLoginFailures.delete(phone);
-        const user = { id: driver.id, name: driver.name, phone, role: 'driver', bus_number: driver.bus_number };
-        const token = createToken(user);
-        activeDriverSessions.set(driver.id, token);
-        return res.json({ token, user: { id: driver.id, name: driver.name, phone, role: 'driver', busNumber: driver.bus_number } });
-    } catch (error) { return res.status(500).json({ error: error.message }); }
-});
-
-app.get('/api/admin/drivers/pending', async (req, res) => {
-    const auth = requireAuth(req, res, ['admin', 'caretaker']); if (!auth) return;
-    try { return res.json(await q(`SELECT id,name,phone,bus_number AS "busNumber",created_at AS "createdAt" FROM driver_accounts WHERE status='pending' ORDER BY created_at`)); }
-    catch (error) { return res.status(500).json({ error: error.message }); }
-});
-
-app.get('/api/admin/drivers/approved', async (req, res) => {
-    const auth = requireAuth(req, res, ['admin', 'caretaker']); if (!auth) return;
-    try { return res.json(await q(`SELECT id,name,phone,bus_number AS "busNumber",approved_at AS "createdAt" FROM driver_accounts WHERE status='approved' ORDER BY name`)); }
-    catch (error) { return res.status(500).json({ error: error.message }); }
-});
-
-app.post('/api/admin/drivers/:id/approve', async (req, res) => {
-    const auth = requireAuth(req, res, ['admin', 'caretaker']); if (!auth) return;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const found = await client.query('SELECT * FROM driver_accounts WHERE id=$1 FOR UPDATE', [req.params.id]);
-        if (!found.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Driver not found' }); }
-        const driver = found.rows[0];
-        const conflict = await client.query("SELECT id FROM driver_accounts WHERE bus_number=$1 AND status='approved' AND id<>$2 FOR UPDATE", [driver.bus_number, driver.id]);
-        if (conflict.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'That bus is already assigned to another approved driver' }); }
-        const busExists = await client.query('SELECT bus_number FROM buses WHERE bus_number=$1 AND is_enabled=true', [driver.bus_number]);
-        if (!busExists.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Bus not found' }); }
-        await client.query('DELETE FROM drivers WHERE bus_number=$1', [driver.bus_number]);
-        await client.query('INSERT INTO drivers (id,bus_number,name,phone,is_active) VALUES ($1,$2,$3,$4,true) ON CONFLICT (bus_number) DO UPDATE SET id=EXCLUDED.id,name=EXCLUDED.name,phone=EXCLUDED.phone,is_active=true', [driver.id, driver.bus_number, driver.name, driver.phone]);
-        await client.query("UPDATE driver_accounts SET status='approved', approved_at=COALESCE(approved_at,CURRENT_TIMESTAMP) WHERE id=$1", [driver.id]);
-        await client.query('COMMIT');
-        return res.json({ status: 'approved' });
-    } catch (error) { await client.query('ROLLBACK'); return res.status(500).json({ error: error.message }); }
-    finally { client.release(); }
-});
-
-app.post('/api/admin/drivers/:id/reject', async (req, res) => {
-    const auth = requireAuth(req, res, ['admin', 'caretaker']); if (!auth) return;
-    try {
-        const rows = await q('UPDATE driver_accounts SET status=?, approved_at = NULL WHERE id=? RETURNING *', ['rejected', req.params.id]);
-        if (!rows.length) return res.status(404).json({ error: 'Driver not found' });
-        return res.json({ status: 'rejected' });
-    } catch (error) { return res.status(500).json({ error: error.message }); }
-});
-
-app.patch('/api/admin/drivers/:id', async (req, res) => {
-    const auth = requireAuth(req, res, ['admin', 'caretaker']); if (!auth) return;
-    const { action, busNumber } = req.body || {};
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const found = await client.query('SELECT * FROM driver_accounts WHERE id=$1 FOR UPDATE', [req.params.id]);
-        if (!found.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Driver not found' }); }
-        const driver = found.rows[0];
-        if (action === 'reject') await client.query("UPDATE driver_accounts SET status='rejected' WHERE id=$1", [driver.id]);
-        else if (action === 'remove') {
-            await client.query('DELETE FROM drivers WHERE bus_number=$1 AND id=$2', [driver.bus_number, driver.id]);
-            await client.query("UPDATE driver_accounts SET status='removed' WHERE id=$1", [driver.id]);
-            for (const [token, session] of sessions) if (session.userId === driver.id) sessions.delete(token);
-            activeDriverSessions.delete(driver.id);
-        } else if (action === 'approve' || action === 'reassign') {
-            const nextBus = Number(busNumber || driver.bus_number);
-            const conflict = await client.query("SELECT id FROM driver_accounts WHERE bus_number=$1 AND status='approved' AND id<>$2 FOR UPDATE", [nextBus, driver.id]);
-            if (conflict.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'That bus is already assigned to another approved driver' }); }
-            const busExists = await client.query('SELECT bus_number FROM buses WHERE bus_number=$1 AND is_enabled=true', [nextBus]);
-            const oldClaim = await client.query('SELECT id FROM drivers WHERE bus_number=$1 AND is_active=true AND id<>$2', [nextBus, driver.id]);
-            if (oldClaim.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Remove the current bus assignment before assigning this bus to another driver' }); }
-            if (!busExists.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Bus not found' }); }
-            await client.query('DELETE FROM drivers WHERE bus_number=$1', [driver.bus_number]);
-            await client.query('INSERT INTO drivers (id,bus_number,name,phone,is_active) VALUES ($1,$2,$3,$4,true) ON CONFLICT (bus_number) DO UPDATE SET id=EXCLUDED.id,name=EXCLUDED.name,phone=EXCLUDED.phone,is_active=true', [driver.id,nextBus,driver.name,driver.phone]);
-            await client.query("UPDATE driver_accounts SET bus_number=$1,status='approved',approved_at=COALESCE(approved_at,CURRENT_TIMESTAMP) WHERE id=$2", [nextBus,driver.id]);
-            for (const [token, session] of sessions) if (session.userId === driver.id) sessions.delete(token);
-            activeDriverSessions.delete(driver.id);
-        } else { await client.query('ROLLBACK'); return res.status(400).json({ error: 'action must be approve, reject, reassign, or remove' }); }
-        await client.query('COMMIT'); return res.json({ status: action });
-    } catch (error) { await client.query('ROLLBACK'); return res.status(500).json({ error: error.message }); }
-    finally { client.release(); }
-});
-
 app.post('/api/auth/logout', (req, res) => {
     const auth = requireAuth(req, res); if (!auth) return;
-    sessions.delete(auth.token); if (auth.role === 'driver') activeDriverSessions.delete(auth.userId);
+    sessions.delete(auth.token);
     return res.json({ status: 'success' });
 });
 
@@ -685,24 +548,21 @@ app.get('/api/buses/live', async (req, res) => {
                 b.route,
                 t.lat,
                 t.lng,
-                t.accuracy AS hdop,
+                t.accuracy,
+                t.hdop,
+                t.has_fix,
+                t.satellites,
+                t.net_type,
                 t.status AS telemetry_status,
-                t.received_at,
-                NULL AS satellites,
-                'API' AS net_type
+                t.received_at
             FROM buses b
-            LEFT JOIN (
-                SELECT DISTINCT ON (bus_id)
-                    bus_id,
-                    lat,
-                    lng,
-                    accuracy,
-                    status,
-                    received_at
+            LEFT JOIN LATERAL (
+                SELECT bus_id, lat, lng, accuracy, has_fix, satellites, hdop, net_type, status, received_at
                 FROM telemetry
-                WHERE bus_id IS NOT NULL
-                ORDER BY bus_id, received_at DESC
-            ) t ON t.bus_id = CAST(b.bus_number AS TEXT)
+                WHERE regexp_replace(bus_id, '[^0-9]', '', 'g') = b.bus_number::text
+                ORDER BY received_at DESC, id DESC
+                LIMIT 1
+            ) t ON true
             ${where}
             ORDER BY b.bus_number
             `,
@@ -716,6 +576,180 @@ app.get('/api/buses/live', async (req, res) => {
                 status: row.telemetry_status || row.status,
             })),
         });
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/buses/stream', async (req, res) => {
+    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin']);
+    if (!auth) return;
+
+    try {
+        const hostel = auth.role === 'student' ? auth.hostelId : null;
+        const rows = await q(`
+            SELECT b.bus_number, b.assigned_hostel, b.status, b.latitude, b.longitude, b.speed, b.route,
+                   t.lat, t.lng, t.heading, t.has_fix, t.satellites, t.hdop, t.net_type, t.status AS telemetry_status, t.received_at
+            FROM buses b
+            LEFT JOIN LATERAL (
+                SELECT bus_id, lat, lng, heading, has_fix, satellites, hdop, net_type, status, received_at
+                FROM telemetry
+                WHERE regexp_replace(bus_id, '[^0-9]', '', 'g') = b.bus_number::text
+                ORDER BY received_at DESC, id DESC
+                LIMIT 1
+            ) t ON true
+            WHERE b.is_enabled = true AND ($1::text IS NULL OR LOWER(b.assigned_hostel) = LOWER($1))
+            ORDER BY b.bus_number
+        `, [hostel || null]);
+
+        const initialData = rows.map((row) => {
+            const item = {
+                bus_number: row.bus_number,
+                busNumber: row.bus_number,
+                status: row.telemetry_status || row.status,
+                lat: row.lat == null ? Number(row.latitude) : Number(row.lat),
+                lng: row.lng == null ? Number(row.longitude) : Number(row.lng),
+                latitude: row.lat == null ? Number(row.latitude) : Number(row.lat),
+                longitude: row.lng == null ? Number(row.longitude) : Number(row.lng),
+                heading: Number(row.heading || 0),
+                speed: Number(row.speed || 0),
+                route: row.route,
+                hostel: row.assigned_hostel,
+                assigned_hostel: row.assigned_hostel,
+                hasFix: row.has_fix ?? (row.lat != null && row.lng != null),
+                lastUpdated: row.received_at || null,
+                timestamp: row.received_at || null,
+            };
+            if (auth.role !== 'student') {
+                item.satellites = row.satellites ?? 0;
+                item.hdop = Number(row.hdop ?? row.accuracy ?? 99.9);
+                item.netType = row.net_type || 'unknown';
+            }
+            return item;
+        });
+
+        res.status(200);
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders?.();
+        res.write(`data: ${JSON.stringify(initialData)}\n\n`);
+
+        const onUpdate = (data) => {
+            if (auth.role === 'student' && (!auth.hostelId || auth.hostelId.toUpperCase() !== String(data.assigned_hostel || '').toUpperCase())) return;
+            const eventData = { ...data };
+            if (auth.role === 'student') {
+                delete eventData.satellites;
+                delete eventData.hdop;
+                delete eventData.net_type;
+                delete eventData.netType;
+            }
+            if (res.writable) res.write(`data: ${JSON.stringify([eventData])}\n\n`);
+        };
+        const heartbeat = setInterval(() => {
+            if (res.writable) res.write(': keep-alive\n\n');
+        }, 25000);
+        telemetryEmitter.on('live_update', onUpdate);
+        req.on('close', () => {
+            clearInterval(heartbeat);
+            telemetryEmitter.removeListener('live_update', onUpdate);
+        });
+    } catch (error) {
+        if (!res.headersSent) return res.status(500).json({ error: error.message });
+        res.end();
+    }
+});
+
+app.get('/api/telemetry/diagnostics', async (req, res) => {
+    const auth = requireAuth(req, res, ['caretaker', 'admin']);
+    if (!auth) return;
+    try {
+        const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 50, 1), 200);
+        const values = [];
+        let filter = '';
+        if (req.query.bus_id) {
+            const busNumber = String(req.query.bus_id).replace(/[^0-9]/g, '');
+            if (!busNumber) return res.status(400).json({ error: 'bus_id must include a bus number' });
+            values.push(busNumber);
+            filter += ` AND regexp_replace(t.bus_id, '[^0-9]', '', 'g') = $${values.length}`;
+        }
+        if (auth.role === 'caretaker') {
+            values.push(auth.hostelId || '');
+            filter += ` AND b.assigned_hostel = $${values.length}`;
+        }
+        values.push(limit);
+        const rows = await pool.query(`
+            SELECT t.id, t.device_id, t.bus_id, t.lat, t.lng, t.speed, t.accuracy, t.has_fix,
+                   t.satellites, t.hdop, t.net_type, t.ts, t.status, t.received_at
+            FROM telemetry t
+            LEFT JOIN buses b ON regexp_replace(t.bus_id, '[^0-9]', '', 'g') = b.bus_number::text
+            WHERE true ${filter}
+            ORDER BY t.received_at DESC, t.id DESC
+            LIMIT $${values.length}
+        `, values);
+        const data = rows.rows.map((row) => ({
+            id: row.id,
+            deviceId: row.device_id,
+            busId: row.bus_id,
+            lat: Number(row.lat),
+            lng: Number(row.lng),
+            speed: Number(row.speed || 0),
+            accuracy: Number(row.accuracy || 1),
+            hasFix: row.has_fix ?? false,
+            satellites: row.satellites ?? 0,
+            hdop: Number(row.hdop ?? 99.9),
+            netType: row.net_type || 'unknown',
+            timestamp: row.ts,
+            status: row.status,
+            receivedAt: row.received_at,
+        }));
+        const average = (list, key) => list.length ? Math.round(list.reduce((sum, item) => sum + item[key], 0) / list.length * 10) / 10 : 0;
+        return res.json({
+            status: 'success',
+            summary: {
+                totalPackets: data.length,
+                fixRate: data.length ? `${Math.round(data.filter((item) => item.hasFix).length / data.length * 100)}%` : '0%',
+                avgSatellites: average(data, 'satellites'),
+                avgHdop: data.length ? average(data, 'hdop') : 99.9,
+                latestPacket: data[0] || null,
+            },
+            data,
+        });
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/telemetry/history', async (req, res) => {
+    const auth = requireAuth(req, res, ['caretaker', 'admin']);
+    if (!auth) return;
+    const busId = String(req.query.bus_id || '').replace(/[^0-9]/g, '');
+    if (!busId) return res.status(400).json({ error: 'bus_id must include a bus number' });
+    const end = req.query.end_time ? new Date(String(req.query.end_time)) : new Date();
+    const start = req.query.start_time ? new Date(String(req.query.start_time)) : new Date(end.getTime() - 24 * 60 * 60 * 1000);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+        return res.status(400).json({ error: 'Invalid start_time or end_time' });
+    }
+    try {
+        const values = [busId, start.toISOString(), end.toISOString()];
+        let hostelFilter = '';
+        if (auth.role === 'caretaker') {
+            values.push(auth.hostelId || '');
+            hostelFilter = ` AND b.assigned_hostel = $${values.length}`;
+        }
+        const rows = await pool.query(`
+            SELECT t.id, t.bus_id AS "busId", t.lat, t.lng, t.speed, t.ts, t.status, t.received_at AS "receivedAt"
+            FROM telemetry t
+            LEFT JOIN buses b ON regexp_replace(t.bus_id, '[^0-9]', '', 'g') = b.bus_number::text
+            WHERE regexp_replace(t.bus_id, '[^0-9]', '', 'g') = $1 AND t.received_at >= $2 AND t.received_at <= $3 ${hostelFilter}
+            ORDER BY t.received_at ASC, t.id ASC
+        `, values);
+        return res.json({ status: 'success', data: rows.rows.map((row) => ({
+            ...row,
+            lat: Number(row.lat),
+            lng: Number(row.lng),
+            speed: Number(row.speed || 0),
+        })) });
     } catch (error) {
         return res.status(500).json({ error: error.message });
     }
@@ -737,16 +771,65 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+app.post('/api/auth/driver-login', async (req, res) => {
+    const phone = String(req.body?.phone || '').replace(/\D/g, '').slice(-10);
+    const pin = String(req.body?.pin || '');
+    if (!/^[6-9]\d{9}$/.test(phone) || !/^\d{6}$/.test(pin)) {
+        return res.status(400).json({ error: 'Enter a valid mobile number and 6-digit PIN' });
+    }
+    const now = Date.now();
+    let attempts = driverLoginFailures.get(phone);
+    if (attempts?.lockedUntil > now) return res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
+    if (attempts?.lockedUntil && attempts.lockedUntil <= now) {
+        driverLoginFailures.delete(phone);
+        attempts = null;
+    }
+
+    try {
+        const rows = await q(`
+            SELECT d.id, d.name, d.phone, d.bus_number, d.pin_hash, d.is_active, b.is_enabled
+            FROM drivers d JOIN buses b ON b.bus_number = d.bus_number
+            WHERE regexp_replace(d.phone, '[^0-9]', '', 'g') LIKE ? AND d.is_active = true
+            ORDER BY d.bus_number LIMIT 1
+        `, [`%${phone}`]);
+        const driver = rows[0];
+        const pinMatches = driver?.pin_hash ? await bcrypt.compare(pin, driver.pin_hash) : false;
+        if (!driver || !driver.is_enabled || !pinMatches) {
+            const failures = (attempts?.count || 0) + 1;
+            driverLoginFailures.set(phone, { count: failures, lockedUntil: failures >= 5 ? now + 15 * 60 * 1000 : 0 });
+            return res.status(driver ? 401 : 404).json({ error: driver ? 'Incorrect PIN' : 'Mobile number not recognized' });
+        }
+        driverLoginFailures.delete(phone);
+        const user = { id: driver.id, name: driver.name || 'Driver', phone: driver.phone, bus_number: driver.bus_number, role: 'driver' };
+        const token = createToken(user);
+        return res.json({ token, user: { id: user.id, name: user.name, phone: user.phone, busNumber: user.bus_number, role: 'driver' } });
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/auth/driver/me', async (req, res) => {
+    const auth = requireAuth(req, res, ['driver']);
+    if (!auth) return;
+    try {
+        const rows = await q(`SELECT d.id, d.name, d.phone, d.bus_number, d.is_active, b.is_enabled
+            FROM drivers d JOIN buses b ON b.bus_number = d.bus_number WHERE d.id = ? LIMIT 1`, [auth.userId]);
+        if (!rows.length || !rows[0].is_active || !rows[0].is_enabled) {
+            sessions.delete(auth.token);
+            return res.status(401).json({ error: 'Driver access has been disabled' });
+        }
+        const driver = rows[0];
+        return res.json({ user: { id: driver.id, name: driver.name || 'Driver', phone: driver.phone, busNumber: driver.bus_number, role: 'driver' } });
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+});
+
 app.get('/api/me', async (req, res) => {
     const auth = requireAuth(req, res);
     if (!auth) return;
 
     try {
-        if (auth.role === 'driver') {
-            const drivers = await q("SELECT id,name,phone,bus_number AS \"busNumber\",'driver' AS role FROM driver_accounts WHERE id=? AND status='approved' LIMIT 1", [auth.userId]);
-            if (!drivers.length) return res.status(404).json({ error: 'Driver account not found' });
-            return res.json({ status: 'success', user: drivers[0] });
-        }
         const rows = await q('SELECT id, name, email, role, hostel_id FROM users WHERE id = ? LIMIT 1', [auth.userId]);
         if (rows.length === 0) return res.status(404).json({ error: 'User not found' });
         return res.json({ status: 'success', user: publicUser(rows[0]) });
@@ -810,9 +893,13 @@ app.post('/api/buses', async (req, res) => {
 
     try {
         const { busNumber, assignedHostel, driverName, driverPhone, latitude, longitude, route } = req.body || {};
-        if (busNumber === undefined || !driverName || !driverPhone) {
+        if (busNumber === undefined || !String(driverName || '').trim() || !String(driverPhone || '').trim()) {
             return res.status(400).json({ error: 'busNumber, driverName, and driverPhone are required' });
         }
+        const normalizedPhone = String(driverPhone).replace(/\D/g, '').slice(-10);
+        if (!/^[6-9]\d{9}$/.test(normalizedPhone)) return res.status(400).json({ error: 'Enter a valid 10-digit Indian mobile number' });
+        const duplicatePhone = await q("SELECT bus_number FROM drivers WHERE regexp_replace(phone, '[^0-9]', '', 'g') LIKE ? LIMIT 1", [`%${normalizedPhone}`]);
+        if (duplicatePhone.length) return res.status(409).json({ error: 'This mobile number is already assigned to another bus' });
 
         const existing = await q('SELECT bus_number FROM buses WHERE bus_number = ? LIMIT 1', [busNumber]);
         if (existing.length) {
@@ -824,8 +911,11 @@ app.post('/api/buses', async (req, res) => {
             return res.status(400).json({ error: 'assignedHostel is required' });
         }
 
-        await q(
-            'INSERT INTO buses (bus_number, assigned_hostel, status, latitude, longitude, speed, is_enabled, route) VALUES (?, ?, ?, ?, ?, ?, 1, ?)',
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            await client.query(
+            'INSERT INTO buses (bus_number, assigned_hostel, status, latitude, longitude, speed, is_enabled, route) VALUES ($1, $2, $3, $4, $5, $6, true, $7)',
             [
                 Number(busNumber),
                 targetHostel,
@@ -837,12 +927,17 @@ app.post('/api/buses', async (req, res) => {
             ]
         );
 
-        await q('INSERT INTO drivers (id, bus_number, name, phone, is_active) VALUES (?, ?, ?, ?, 1)', [
-            uid('drv_'),
-            Number(busNumber),
-            String(driverName),
-            String(driverPhone),
-        ]);
+            await client.query('INSERT INTO drivers (id,bus_number,name,phone,is_active) VALUES ($1,$2,$3,$4,true)', [
+                uid('drv_'), Number(busNumber), String(driverName).trim(), normalizedPhone,
+            ]);
+            await client.query('COMMIT');
+        } catch (error) {
+            await client.query('ROLLBACK');
+            if (error.code === '23505') return res.status(409).json({ error: 'Bus number already exists' });
+            throw error;
+        } finally {
+            client.release();
+        }
 
         const created = await fetchBusByNumber(busNumber);
         return res.status(201).json({ status: 'success', data: created });
@@ -862,40 +957,29 @@ app.patch('/api/buses/:busNumber/driver', async (req, res) => {
             return res.status(access.code).json({ error: access.message });
         }
 
-        const { name, phone, isActive } = req.body || {};
-        if (!name && !phone && isActive === undefined) {
-            return res.status(400).json({ error: 'At least one of name, phone, isActive is required' });
+        const { driverName, driverPhone, pin } = req.body || {};
+        if (!String(driverName || '').trim() || !String(driverPhone || '').trim()) {
+            return res.status(400).json({ error: 'driverName and driverPhone are required' });
         }
 
-        const rows = await q('SELECT id FROM drivers WHERE bus_number = ? LIMIT 1', [busNumber]);
-        if (!rows.length) {
-            if (!name || !phone) {
-                return res.status(400).json({ error: 'name and phone are required to create a new driver' });
+        const normalizedPhone = String(driverPhone).replace(/\D/g, '').slice(-10);
+        if (!/^[6-9]\d{9}$/.test(normalizedPhone)) return res.status(400).json({ error: 'Enter a valid 10-digit Indian mobile number' });
+        if (pin !== undefined && pin !== '' && !/^\d{6}$/.test(String(pin))) return res.status(400).json({ error: 'PIN must contain exactly 6 digits' });
+        const duplicate = await q("SELECT bus_number FROM drivers WHERE regexp_replace(phone, '[^0-9]', '', 'g') LIKE ? AND bus_number <> ? LIMIT 1", [`%${normalizedPhone}`, busNumber]);
+        if (duplicate.length) return res.status(409).json({ error: 'This mobile number is already assigned to another bus' });
+
+        const currentDriver = await q('SELECT id FROM drivers WHERE bus_number=? LIMIT 1', [busNumber]);
+        const pinHash = pin ? await bcrypt.hash(String(pin), 10) : null;
+        if (currentDriver.length) {
+            if (pinHash) {
+                await q('UPDATE drivers SET name=?, phone=?, pin_hash=?, is_active=true WHERE bus_number=?', [String(driverName).trim(), normalizedPhone, pinHash, busNumber]);
+            } else {
+                await q('UPDATE drivers SET name=?, phone=?, is_active=true WHERE bus_number=?', [String(driverName).trim(), normalizedPhone, busNumber]);
             }
-            await q('INSERT INTO drivers (id, bus_number, name, phone, is_active) VALUES (?, ?, ?, ?, ?)', [
-                uid('drv_'),
-                busNumber,
-                name,
-                phone,
-                isActive === undefined ? 1 : (isActive ? 1 : 0),
-            ]);
         } else {
-            const updates = [];
-            const params = [];
-            if (name) {
-                updates.push('name = ?');
-                params.push(name);
-            }
-            if (phone) {
-                updates.push('phone = ?');
-                params.push(phone);
-            }
-            if (isActive !== undefined) {
-                updates.push('is_active = ?');
-                params.push(isActive ? 1 : 0);
-            }
-            params.push(busNumber);
-            await q(`UPDATE drivers SET ${updates.join(', ')} WHERE bus_number = ?`, params);
+            await q('INSERT INTO drivers (id,bus_number,name,phone,pin_hash,is_active) VALUES (?,?,?,?,?,true)', [
+                uid('drv_'), busNumber, String(driverName).trim(), normalizedPhone, pinHash,
+            ]);
         }
 
         const updatedBus = await fetchBusByNumber(busNumber);
@@ -1135,19 +1219,85 @@ app.post('/api/notifications/send', async (req, res) => {
 });
 
 app.post('/api/location', async (req, res) => {
-    const auth = requireAuth(req, res, ['driver']); if (!auth) return;
+    const auth = requireAuth(req, res, ['driver']);
+    if (!auth) return;
+    const busNumber = Number(req.body?.busNumber);
+    if (!Number.isInteger(busNumber) || busNumber !== Number(auth.busNumber)) {
+        return res.status(403).json({ error: 'This token can update only its assigned bus' });
+    }
+    const lat = Number(req.body?.lat);
+    const lng = Number(req.body?.lng);
+    const clientSpeed = Number(req.body?.speed);
+    const accuracy = Number(req.body?.accuracy);
+    const timestamp = req.body?.timestamp ? new Date(req.body.timestamp) : new Date();
+    const requestedStatus = req.body?.status === 'idle' ? 'idle' : null;
+    if (!Number.isFinite(lat) || Math.abs(lat) > 90 || !Number.isFinite(lng) || Math.abs(lng) > 180 ||
+        !Number.isFinite(clientSpeed) || clientSpeed < 0 || clientSpeed > 250 ||
+        !Number.isFinite(accuracy) || accuracy < 0 || accuracy > 50 || Number.isNaN(timestamp.getTime()) ||
+        timestamp.getTime() > Date.now() + 5 * 60 * 1000) {
+        return res.status(400).json({ error: 'Invalid GPS fix; location accuracy must be 50m or better' });
+    }
+
+    let previous = driverLastFixes.get(busNumber);
+    if (!previous) {
+        const previousRows = await q('SELECT lat, lng, speed, ts FROM telemetry WHERE device_id=? ORDER BY received_at DESC, id DESC LIMIT 1', [`driver:${auth.userId}`]);
+        if (previousRows.length) {
+            const storedAt = Date.parse(previousRows[0].ts || '');
+            if (Number.isFinite(storedAt)) {
+                previous = { lat: Number(previousRows[0].lat), lng: Number(previousRows[0].lng), speed: Number(previousRows[0].speed || 0), timestamp: storedAt };
+                driverLastFixes.set(busNumber, previous);
+            }
+        }
+    }
+    if (previous && timestamp.getTime() <= previous.timestamp) return res.json({ ok: true, stale: true });
+    const point = { lat, lng, timestamp: timestamp.getTime() };
+    let speed = clientSpeed;
+    let heading = Number(req.body?.heading);
+    if (previous) {
+        const seconds = (point.timestamp - previous.timestamp) / 1000;
+        if (seconds > 0) {
+            const computed = haversineKm(previous, point) / (seconds / 3600);
+            if (Number.isFinite(computed) && computed <= 180 && (clientSpeed > Math.max(computed * 2, 2) || computed > Math.max(clientSpeed * 2, 2))) speed = computed;
+            if (!Number.isFinite(heading) || heading < 0 || heading >= 360) heading = bearingDegrees(previous, point);
+            speed = previous.speed * 0.7 + speed * 0.3;
+        }
+    }
+    if (!Number.isFinite(heading) || heading < 0 || heading >= 360) heading = 0;
+    if (requestedStatus === 'idle') speed = 0;
+    const status = requestedStatus || (speed > 1.5 ? 'running' : 'idle');
+    const buses = await q(`SELECT b.assigned_hostel FROM buses b JOIN drivers d ON d.bus_number=b.bus_number
+        WHERE b.bus_number=? AND b.is_enabled=true AND d.id=? AND d.is_active=true`, [busNumber, auth.userId]);
+    if (!buses.length) return res.status(403).json({ error: 'Driver assignment is no longer active' });
+
     try {
-        const driverRows = await q("SELECT bus_number FROM driver_accounts WHERE id=? AND status='approved'", [auth.userId]);
-        if (!driverRows.length) return res.status(403).json({ error: 'No active bus assignment' });
-        const assignedBus = Number(driverRows[0].bus_number);
-        if (Number(req.body?.busNumber) !== assignedBus) return res.status(403).json({ error: 'Drivers can only publish location for their assigned bus' });
-        const { lat, lng, speed=0, heading=0, accuracy=0, status='idle', timestamp=null } = req.body || {};
-        if (![lat,lng,speed,heading,accuracy].every(v => Number.isFinite(Number(v))) || Number(accuracy) > 50) return res.status(400).json({ error: 'A valid GPS fix with accuracy of 50m or better is required' });
-        const safeStatus = Number(speed) < 1.5 ? 'idle' : (status === 'running' ? 'running' : 'idle');
-        await q('INSERT INTO telemetry (device_id,bus_id,lat,lng,speed,accuracy,ts,status) VALUES (NULL,?,?,?,?,?,?,?)', [String(assignedBus),Number(lat),Number(lng),Number(speed),Number(accuracy),timestamp || new Date().toISOString(),safeStatus]);
-        await q('UPDATE buses SET latitude=?,longitude=?,speed=?,status=? WHERE bus_number=?', [Number(lat),Number(lng),Number(speed),safeStatus,assignedBus]);
-        return res.json({ status: 'success' });
-    } catch (error) { return res.status(500).json({ error: error.message }); }
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            await client.query('INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, heading, has_fix, ts, status) VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)',
+                [`driver:${auth.userId}`, String(busNumber), lat, lng, speed, accuracy, heading, timestamp.toISOString(), status]);
+            await client.query('UPDATE buses SET latitude=$1, longitude=$2, speed=$3, status=$4 WHERE bus_number=$5', [lat, lng, speed, status, busNumber]);
+            await client.query('COMMIT');
+        } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+        } finally {
+            client.release();
+        }
+        const accepted = { ...point, speed };
+        driverLastFixes.set(busNumber, accepted);
+        const update = {
+            busId: String(busNumber), busNumber, bus_number: busNumber,
+            assignedHostel: buses[0].assigned_hostel, assigned_hostel: buses[0].assigned_hostel,
+            lat, lng, latitude: lat, longitude: lng, speed, heading,
+            accuracy, status, hasFix: true, timestamp: timestamp.toISOString(),
+            lastUpdated: timestamp.toISOString(),
+        };
+        telemetryEmitter.emit('live_update', update);
+        return res.status(200).json({ ok: true });
+    } catch (error) {
+        console.error('Driver location update failed:', error.message);
+        return res.status(500).json({ error: 'Could not store location update' });
+    }
 });
 
 app.post('/api/update-location', async (req, res) => {
@@ -1157,33 +1307,39 @@ app.post('/api/update-location', async (req, res) => {
     }
 
     try {
-        const { device_id, bus_id, lat, lng, speed, accuracy, ts, status } = req.body || {};
-        if (lat === undefined || lng === undefined) {
-            return res.status(400).json({ error: 'Invalid payload. lat/lng are required.' });
+        const telemetry = normalizeTelemetry(req.body || {});
+        const { lat: latNum, lng: lngNum, speed: speedNum, accuracy: accuracyNum } = telemetry;
+        if (!Number.isFinite(latNum) || !Number.isFinite(lngNum) || Math.abs(latNum) > 90 || Math.abs(lngNum) > 180 || !Number.isFinite(speedNum) || speedNum < 0 || !Number.isFinite(accuracyNum)) {
+            return res.status(400).json({ error: 'A valid latitude, longitude, speed, and accuracy are required.' });
         }
 
-        const latNum = Number(lat);
-        const lngNum = Number(lng);
-        const speedNum = Number(speed || 0);
-        const accuracyNum = Number(accuracy || 1.0);
-        const normalizedStatus = status || 'idle';
-        const busNumber = Number(String(bus_id || '').replace(/[^0-9]/g, ''));
-        if (!Number.isNaN(busNumber) && busNumber > 0) {
-            const phoneDriver = await q("SELECT id FROM driver_accounts WHERE bus_number=? AND status='approved' LIMIT 1", [busNumber]);
-            if (phoneDriver.length) return res.status(403).json({ error: 'This bus location is published by its assigned driver phone' });
-        }
+        const normalizedStatus = telemetry.status === 'active' ? 'running' : telemetry.status;
+        const busNumber = Number(String(telemetry.busId || '').replace(/[^0-9]/g, ''));
+        if (!Number.isInteger(busNumber) || busNumber <= 0) return res.status(400).json({ error: 'A valid bus_id is required.' });
+        const buses = await q('SELECT assigned_hostel FROM buses WHERE bus_number=? AND is_enabled=true', [busNumber]);
+        if (!buses.length) return res.status(404).json({ error: 'Bus not registered or disabled' });
 
         await q(
-            'INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, ts, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [device_id || null, bus_id?.toString() || null, latNum, lngNum, speedNum, accuracyNum, ts || null, normalizedStatus]
+            'INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, has_fix, satellites, hdop, net_type, ts, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [telemetry.deviceId, telemetry.busId, latNum, lngNum, speedNum, accuracyNum, telemetry.hasFix ?? true, telemetry.satellites, telemetry.hdop, telemetry.netType, telemetry.timestamp || new Date().toISOString(), normalizedStatus]
         );
 
-        if (!Number.isNaN(busNumber) && busNumber > 0) {
-            await q(
-                'UPDATE buses SET latitude = ?, longitude = ?, speed = ?, status = ? WHERE bus_number = ?',
-                [latNum, lngNum, speedNum, normalizedStatus, busNumber]
-            );
-        }
+        await q('UPDATE buses SET latitude = ?, longitude = ?, speed = ?, status = ? WHERE bus_number = ?', [latNum, lngNum, speedNum, normalizedStatus, busNumber]);
+        telemetryEmitter.emit('live_update', {
+            bus_number: busNumber,
+            busNumber,
+            assigned_hostel: buses[0].assigned_hostel,
+            hostel: buses[0].assigned_hostel,
+            lat: latNum,
+            lng: lngNum,
+            speed: speedNum,
+            status: normalizedStatus,
+            hasFix: telemetry.hasFix ?? true,
+            satellites: telemetry.satellites,
+            hdop: telemetry.hdop,
+            netType: telemetry.netType,
+            timestamp: telemetry.timestamp || new Date().toISOString(),
+        });
 
         return res.status(200).json({ message: 'Data received successfully', status: 'success' });
     } catch (error) {
@@ -1291,7 +1447,7 @@ async function start() {
         await initializeDatabase();
         app.listen(port, '0.0.0.0', () => {
             console.log(`Server running on port ${port}`);
-            console.log(`MySQL: ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}`);
+            console.log(`PostgreSQL: ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}`);
             console.log('Seed logins:');
             console.log('  Student: student@nitmz.ac.in / student123');
             console.log('  Caretaker BH1: caretaker-bh1@nitmz.ac.in / caretaker123');

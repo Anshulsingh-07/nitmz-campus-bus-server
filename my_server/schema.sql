@@ -34,27 +34,15 @@ CREATE TABLE IF NOT EXISTS buses (
 CREATE TABLE IF NOT EXISTS drivers (
   id VARCHAR(40) PRIMARY KEY,
   bus_number INT NOT NULL UNIQUE,
-  name VARCHAR(120) NOT NULL,
-  phone VARCHAR(30) NOT NULL,
+  name VARCHAR(120) NULL,
+  phone VARCHAR(30) NULL,
+  pin_hash VARCHAR(100) NULL,
   is_active BOOLEAN NOT NULL DEFAULT true,
   FOREIGN KEY (bus_number) REFERENCES buses(bus_number) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS driver_accounts (
-  id VARCHAR(40) PRIMARY KEY,
-  name VARCHAR(120) NOT NULL,
-  phone VARCHAR(10) NOT NULL UNIQUE,
-  pin_hash VARCHAR(100) NOT NULL,
-  bus_number INT NOT NULL REFERENCES buses(bus_number),
-  status VARCHAR(20) NOT NULL DEFAULT 'pending',
-  failed_attempts INT NOT NULL DEFAULT 0,
-  locked_until TIMESTAMP NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  approved_at TIMESTAMP NULL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS driver_accounts_approved_bus_unique
-  ON driver_accounts (bus_number) WHERE status IN ('pending','approved');
+ALTER TABLE drivers ADD COLUMN IF NOT EXISTS pin_hash VARCHAR(100) NULL;
+DROP INDEX IF EXISTS drivers_active_phone_unique;
 
 
 CREATE TABLE IF NOT EXISTS schedules (
@@ -91,9 +79,20 @@ CREATE TABLE IF NOT EXISTS telemetry (
   lng NUMERIC(10,6) NOT NULL,
   speed NUMERIC(8,2) NOT NULL DEFAULT 0,
   accuracy NUMERIC(8,2) NOT NULL DEFAULT 1.0,
+  heading NUMERIC(6,2) NOT NULL DEFAULT 0,
+  has_fix BOOLEAN NOT NULL DEFAULT false,
+  satellites INT NOT NULL DEFAULT 0,
+  hdop NUMERIC(6,2) NOT NULL DEFAULT 99.9,
+  net_type VARCHAR(20) NOT NULL DEFAULT 'unknown',
   ts VARCHAR(64) NULL,
   status VARCHAR(20) NOT NULL DEFAULT 'idle',
   received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS has_fix BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS satellites INT NOT NULL DEFAULT 0;
+ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS hdop NUMERIC(6,2) NOT NULL DEFAULT 99.9;
+ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS net_type VARCHAR(20) NOT NULL DEFAULT 'unknown';
+ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS heading NUMERIC(6,2) NOT NULL DEFAULT 0;
 
 -- End of schema
