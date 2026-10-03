@@ -32,16 +32,6 @@ const hostelsSeed = [
     { id: 'BH4', name: 'BH4', type: 'Boys', fullName: "Boys' Hostel 4" },
 ];
 
-const usersSeed = [
-    { id: 'caretaker-gh1', name: 'GH1 Caretaker', email: 'caretaker-gh1@nitmz.ac.in', password: 'caretaker123', role: 'caretaker', hostelId: 'GH1' },
-    { id: 'caretaker-gh2', name: 'GH2 Caretaker', email: 'caretaker-gh2@nitmz.ac.in', password: 'caretaker123', role: 'caretaker', hostelId: 'GH2' },
-    { id: 'caretaker-bh1', name: 'BH1 Caretaker', email: 'caretaker-bh1@nitmz.ac.in', password: 'caretaker123', role: 'caretaker', hostelId: 'BH1' },
-    { id: 'caretaker-bh2', name: 'BH2 Caretaker', email: 'caretaker-bh2@nitmz.ac.in', password: 'caretaker123', role: 'caretaker', hostelId: 'BH2' },
-    { id: 'caretaker-bh3', name: 'BH3 Caretaker', email: 'caretaker-bh3@nitmz.ac.in', password: 'caretaker123', role: 'caretaker', hostelId: 'BH3' },
-    { id: 'caretaker-bh4', name: 'BH4 Caretaker', email: 'caretaker-bh4@nitmz.ac.in', password: 'caretaker123', role: 'caretaker', hostelId: 'BH4' },
-    { id: 'student-bh1', name: 'Anshul Student', email: 'student@nitmz.ac.in', password: 'student123', role: 'student', hostelId: 'BH1' },
-];
-
 const busesSeed = [
     [1, 'GH1', 'Pa Hlutea', '9436168711', 23.7285, 92.7180, 'idle', '8:30 AM', '1:30 PM'],
     [2, 'GH1', 'Pu Stephen', '8787778119', 23.7260, 92.7165, 'running', '9:15 AM', '4:30 PM'],
@@ -407,15 +397,19 @@ CREATE TABLE IF NOT EXISTS telemetry (
         }
     }
 
-    const [userCountRow] = await q('SELECT COUNT(*) AS count FROM users');
-    const userCount = userCountRow ? Number(userCountRow.count) : 0;
-    if (userCount === 0) {
-        for (const user of usersSeed) {
-            await q(
-                'INSERT INTO users (id, name, email, password, role, hostel_id) VALUES ($1, $2, $3, $4, $5, $6)',
-                [user.id, user.name, user.email, user.password, user.role, user.hostelId]
-            );
-        }
+    // Remove legacy demo accounts created by earlier versions; their public
+    // credentials must never remain usable after upgrading the server.
+    for (const email of [
+        'student@nitmz.ac.in',
+        'admin@nitmz.ac.in',
+        'caretaker-gh1@nitmz.ac.in',
+        'caretaker-gh2@nitmz.ac.in',
+        'caretaker-bh1@nitmz.ac.in',
+        'caretaker-bh2@nitmz.ac.in',
+        'caretaker-bh3@nitmz.ac.in',
+        'caretaker-bh4@nitmz.ac.in',
+    ]) {
+        await q('DELETE FROM users WHERE LOWER(email) = LOWER(?)', [email]);
     }
 
     const [busCountRow] = await q('SELECT COUNT(*) AS count FROM buses');
@@ -489,7 +483,7 @@ app.get('/api/hostels', async (_req, res) => {
 
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { name, email, password, hostelId, role } = req.body || {};
+        const { name, email, password, hostelId } = req.body || {};
         if (!name || !email || !password) {
             return res.status(400).json({ error: 'name, email, and password are required' });
         }
@@ -507,7 +501,9 @@ app.post('/api/auth/register', async (req, res) => {
             name,
             email,
             password,
-            role: role === 'caretaker' ? 'caretaker' : 'student',
+            // Public registration can only create student accounts. Caretakers
+            // must be provisioned through a trusted administrative process.
+            role: 'student',
             hostel_id: hostelId || 'BH1',
         };
 
@@ -1448,10 +1444,6 @@ async function start() {
         app.listen(port, '0.0.0.0', () => {
             console.log(`Server running on port ${port}`);
             console.log(`PostgreSQL: ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}`);
-            console.log('Seed logins:');
-            console.log('  Student: student@nitmz.ac.in / student123');
-            console.log('  Caretaker BH1: caretaker-bh1@nitmz.ac.in / caretaker123');
-            console.log('  Caretaker GH1: caretaker-gh1@nitmz.ac.in / caretaker123');
             console.log(`ESP32 secure endpoint: http://<YOUR_PC_IP>:${port}/api/update-location`);
             console.log(`Flutter latest endpoint: http://<YOUR_PC_IP>:${port}/api/location/latest`);
         });

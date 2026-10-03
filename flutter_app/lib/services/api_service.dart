@@ -368,9 +368,10 @@ class ApiService {
       if (response.statusCode == 200) return data;
       throw Exception(data['error'] ?? 'Login failed');
     } catch (e) {
-      // Only use demo credentials when backend is unreachable.
       if (e is TimeoutException || e is http.ClientException) {
-        return _demoLogin(email, password);
+        throw Exception(
+          'Could not reach the sign-in server. Check your connection and try again.',
+        );
       }
       rethrow;
     }
@@ -503,47 +504,6 @@ class ApiService {
       }
     }
     throw Exception('Failed to load telemetry history');
-  }
-
-  Map<String, dynamic> _demoLogin(String email, String password) {
-    if (email == 'admin@nitmz.ac.in' && password == 'admin123') {
-      return {
-        'token': 'demo_admin_token',
-        'user': {
-          'id': 'admin1',
-          'name': 'Hostel Caretaker',
-          'email': email,
-          'role': 'admin',
-          'hostelId': null,
-        },
-      };
-    } else if (email == 'caretaker-bh1@nitmz.ac.in' &&
-        password == 'caretaker123') {
-      return {
-        'token': 'demo_caretaker_token',
-        'user': {
-          'id': 'caretaker1',
-          'name': 'BH1 Caretaker',
-          'email': email,
-          'role': 'caretaker',
-          'hostelId': 'BH1',
-        },
-      };
-    } else if (email == 'student@nitmz.ac.in' && password == 'student123') {
-      return {
-        'token': 'demo_student_token',
-        'user': {
-          'id': 'student1',
-          'name': 'Anshul Student',
-          'email': email,
-          'role': 'student',
-          'hostelId': 'BH1',
-        },
-      };
-    }
-    throw Exception(
-      'Invalid credentials. Use caretaker-bh1@nitmz.ac.in/caretaker123 or student@nitmz.ac.in/student123',
-    );
   }
 
   Future<Map<String, dynamic>> register(

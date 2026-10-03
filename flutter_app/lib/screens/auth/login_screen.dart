@@ -44,8 +44,6 @@ class _LoginScreenState extends State<LoginScreen>
       end: Offset.zero,
     ).animate(CurvedAnimation(parent: _animCtrl, curve: Curves.easeOut));
     _animCtrl.forward();
-    _emailCtrl.text = 'student@nitmz.ac.in';
-    _passCtrl.text = 'student123';
   }
 
   @override
@@ -63,10 +61,8 @@ class _LoginScreenState extends State<LoginScreen>
   void _toggleRole(bool isAdmin) {
     setState(() {
       _isAdmin = isAdmin;
-      _emailCtrl.text = isAdmin
-          ? 'caretaker-bh1@nitmz.ac.in'
-          : 'student@nitmz.ac.in';
-      _passCtrl.text = isAdmin ? 'caretaker123' : 'student123';
+      _emailCtrl.clear();
+      _passCtrl.clear();
     });
   }
 
@@ -300,36 +296,6 @@ class _LoginScreenState extends State<LoginScreen>
                         if (_isRegister) _buildHostelDropdown(),
                         if (_isRegister) const SizedBox(height: 14),
 
-                        // Demo hint
-                        if (!_isRegister)
-                          Container(
-                            padding: const EdgeInsets.all(10),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFFF3F4F6),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Row(
-                              children: [
-                                const Icon(
-                                  Icons.info_outline,
-                                  size: 16,
-                                  color: Color(0xFF6B7280),
-                                ),
-                                const SizedBox(width: 6),
-                                Expanded(
-                                  child: Text(
-                                    _isAdmin
-                                        ? 'caretaker-bh1@nitmz.ac.in / caretaker123'
-                                        : 'student@nitmz.ac.in / student123',
-                                    style: const TextStyle(
-                                      fontSize: 12,
-                                      color: Color(0xFF6B7280),
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
                         const SizedBox(height: 20),
 
                         if (auth.error != null)
