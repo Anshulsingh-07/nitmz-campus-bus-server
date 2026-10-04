@@ -43,8 +43,9 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 
-        val mapsApiKey =
-            (project.findProperty("MAPS_API_KEY") as String?) ?: ""
+        val mapsApiKey = keystoreProperties.getProperty("mapsApiKey")
+            ?: (project.findProperty("MAPS_API_KEY") as String?)
+            ?: ""
         manifestPlaceholders["MAPS_API_KEY"] = mapsApiKey
     }
 

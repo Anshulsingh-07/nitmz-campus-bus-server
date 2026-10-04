@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS users (
   FOREIGN KEY (hostel_id) REFERENCES hostels(id) ON DELETE SET NULL
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false;
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique ON users (LOWER(email));
+
 CREATE TABLE IF NOT EXISTS buses (
   bus_number INT PRIMARY KEY,
   assigned_hostel VARCHAR(10) NOT NULL,

@@ -105,7 +105,7 @@ class NotificationService extends ChangeNotifier {
       if (diffMinutes >= 0 && diffMinutes <= 2) {
         final message = diffMinutes == 0
             ? 'Bus ${bus.busNumber} is leaving now from ${candidate.sourceLabel}. Please come fast!'
-            : 'Bus ${bus.busNumber} is leaving from ${candidate.sourceLabel} in ${diffMinutes} minute${diffMinutes == 1 ? '' : 's'}. Please come fast!';
+            : 'Bus ${bus.busNumber} is leaving from ${candidate.sourceLabel} in $diffMinutes minute${diffMinutes == 1 ? '' : 's'}. Please come fast!';
 
         return NotificationModel(
           id: '${bus.busNumber}-${candidate.departureTime.millisecondsSinceEpoch}',

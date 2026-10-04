@@ -2,113 +2,13 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
+import '../config/app_config.dart';
 import '../models/bus_location.dart';
 
 class ApiService {
-  // Main app backend base URL (auth, schedules, etc.)
-  static const String _apiBaseUrlOverride = String.fromEnvironment(
-    'API_BASE_URL',
-    defaultValue: '',
-  );
-  static const String _apiHostOverride = String.fromEnvironment(
-    'API_HOST',
-    defaultValue: '',
-  );
-  static const String apiPort = String.fromEnvironment(
-    'API_PORT',
-    defaultValue: '8080',
-  );
-  // Allow runtime `.env` override for API port as well.
-  static String? _envVar(String key) {
-    try {
-      return dotenv.env[key];
-    } catch (_) {
-      return null;
-    }
-  }
-
-  static String get apiPortEffective =>
-      (_envVar('API_PORT')?.trim().isNotEmpty == true)
-      ? _envVar('API_PORT')!.trim()
-      : apiPort;
-  static String get apiBaseUrl {
-    final envBaseUrl = _envVar('API_BASE_URL');
-    if (envBaseUrl != null && envBaseUrl.trim().isNotEmpty) {
-      return _normalizeApiBase(envBaseUrl);
-    }
-
-    if (_apiBaseUrlOverride.isNotEmpty) {
-      return _normalizeApiBase(_apiBaseUrlOverride);
-    }
-
-    final envHost = _envVar('API_HOST');
-    if (envHost != null && envHost.trim().isNotEmpty) {
-      final host = envHost.trim();
-      if (host.startsWith('http://') || host.startsWith('https://')) {
-        return _normalizeApiBase(host);
-      }
-      return _normalizeApiBase('http://$host:$apiPortEffective');
-    }
-
-    final host = apiHost.trim();
-    if (host.startsWith('http://') || host.startsWith('https://')) {
-      return _normalizeApiBase(host);
-    }
-
-    return _normalizeApiBase('http://$host:$apiPortEffective');
-  }
-
-  static String get apiHost {
-    // Priority: compile-time override (--dart-define), then runtime .env, then default.
-    if (_apiHostOverride.isNotEmpty) return _apiHostOverride;
-    final envHost = _envVar('API_HOST');
-    if (envHost != null && envHost.trim().isNotEmpty) return envHost.trim();
-    return defaultApiHost;
-  }
-
-  static String get baseUrl => apiBaseUrl;
-  // ESP32 telemetry server base URL (Flask)
-  static const String _trackingHostOverride = String.fromEnvironment(
-    'TRACKING_HOST',
-    defaultValue: '',
-  );
-  static const String _trackingBaseUrlOverride = String.fromEnvironment(
-    'TRACKING_BASE_URL',
-    defaultValue: '',
-  );
-  static const String _trackingPublicUrlOverride = String.fromEnvironment(
-    'TRACKING_PUBLIC_URL',
-    defaultValue: 'https://matador-unneeded-synergy.ngrok-free.dev',
-  );
-  static const String trackingPort = String.fromEnvironment(
-    'TRACKING_PORT',
-    defaultValue: '8000',
-  );
-  static String get trackingHost =>
-      _trackingHostOverride.isNotEmpty ? _trackingHostOverride : apiHost;
-  static String get trackingBaseUrl {
-    if (_trackingBaseUrlOverride.isNotEmpty) {
-      return _normalizeApiBase(_trackingBaseUrlOverride);
-    }
-
-    if (kIsWeb && _trackingPublicUrlOverride.isNotEmpty) {
-      return _normalizeApiBase(_trackingPublicUrlOverride);
-    }
-
-    final host = trackingHost.trim();
-    final hostHasScheme =
-        host.startsWith('http://') || host.startsWith('https://');
-
-    if (hostHasScheme) {
-      return _normalizeApiBase(host);
-    }
-
-    return _normalizeApiBase('http://$host:$trackingPort');
-  }
-
-  static String get trackingLatestEndpoint =>
-      '$trackingBaseUrl/location/latest';
+  static String get baseUrl => _normalizeApiBase(AppConfig.apiBaseUrl);
+  static String get trackingBaseUrl => baseUrl;
+  static String get trackingLatestEndpoint => '$baseUrl/location/latest';
   static const Duration _telemetryEndpointBackoff = Duration(seconds: 45);
   static final Map<String, DateTime> _telemetryBackoffUntil = {};
 
@@ -123,73 +23,49 @@ class ApiService {
     return base;
   }
 
-  static String get defaultApiHost {
-    // Use the local dev backend by default so the app talks to the repo's server
-    // during development and testing. Override with API_HOST/API_BASE_URL when
-    // you intentionally need a different backend.
-    if (kIsWeb) return 'http://localhost:8080';
-    return 'http://10.0.2.2:8080';
-  }
-
   static Future<BusLocation?> fetchLatestLocation() async {
-    final rawEndpoints = [
-      // Prefer live ESP32 tracker feed first; use Node endpoint only as fallback.
-      '$trackingBaseUrl/location/latest',
-      if (_trackingPublicUrlOverride.isNotEmpty)
-        '${_normalizeApiBase(_trackingPublicUrlOverride)}/location/latest',
-      '$baseUrl/location/latest',
-    ];
-
-    final endpoints = <String>[];
-    final seen = <String>{};
-    for (final endpoint in rawEndpoints) {
-      if (seen.add(endpoint)) endpoints.add(endpoint);
-    }
+    final endpoint = '$baseUrl/location/latest';
 
     final now = DateTime.now();
+    final backoffUntil = _telemetryBackoffUntil[endpoint];
+    if (backoffUntil != null && now.isBefore(backoffUntil)) {
+      return null;
+    }
 
-    for (final endpoint in endpoints) {
-      final backoffUntil = _telemetryBackoffUntil[endpoint];
-      if (backoffUntil != null && now.isBefore(backoffUntil)) {
-        continue;
+    try {
+      final response = await http
+          .get(Uri.parse(endpoint))
+          .timeout(const Duration(seconds: 4));
+      if (kDebugMode) {
+        debugPrint('Telemetry GET $endpoint -> ${response.statusCode}');
+      }
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data is Map<String, dynamic>) {
+          _telemetryBackoffUntil.remove(endpoint);
+          final payload = data['data'] is Map<String, dynamic>
+              ? data['data'] as Map<String, dynamic>
+              : data;
+          final location = BusLocation.fromJson(payload);
+          if (kDebugMode) {
+            debugPrint(
+              'Telemetry parsed from $endpoint: '
+              'bus=${location.busId}, lat=${location.lat}, lng=${location.lng}, speed=${location.speed}',
+            );
+          }
+          return location;
+        }
       }
 
-      try {
-        final response = await http
-            .get(Uri.parse(endpoint))
-            .timeout(const Duration(seconds: 4));
-        if (kDebugMode) {
-          debugPrint('Telemetry GET $endpoint -> ${response.statusCode}');
-        }
-        if (response.statusCode == 200) {
-          final data = jsonDecode(response.body);
-          if (data is Map<String, dynamic>) {
-            _telemetryBackoffUntil.remove(endpoint);
-            final payload = data['data'] is Map<String, dynamic>
-                ? data['data'] as Map<String, dynamic>
-                : data;
-            final location = BusLocation.fromJson(payload);
-            if (kDebugMode) {
-              debugPrint(
-                'Telemetry parsed from $endpoint: '
-                'bus=${location.busId}, lat=${location.lat}, lng=${location.lng}, speed=${location.speed}',
-              );
-            }
-            return location;
-          }
-        }
-
-        _telemetryBackoffUntil[endpoint] = DateTime.now().add(
-          _telemetryEndpointBackoff,
-        );
-      } catch (e) {
-        _telemetryBackoffUntil[endpoint] = DateTime.now().add(
-          _telemetryEndpointBackoff,
-        );
-        if (kDebugMode) {
-          debugPrint('Telemetry fetch failed for $endpoint: $e');
-        }
-        // Try next endpoint.
+      _telemetryBackoffUntil[endpoint] = DateTime.now().add(
+        _telemetryEndpointBackoff,
+      );
+    } catch (e) {
+      _telemetryBackoffUntil[endpoint] = DateTime.now().add(
+        _telemetryEndpointBackoff,
+      );
+      if (kDebugMode) {
+        debugPrint('Telemetry fetch failed for $endpoint: $e');
       }
     }
 
@@ -197,84 +73,11 @@ class ApiService {
   }
 
   static Future<List<BusLocation>> getAllBusesLocations({String? token}) async {
-    try {
-      final endpoints = [
-        '$baseUrl/buses/live',
-        '$baseUrl/buses',
-        '$baseUrl/all-buses',
-      ];
-
-      for (final endpoint in endpoints) {
-        try {
-          final response = await http
-              .get(Uri.parse(endpoint), headers: _headers(token))
-              .timeout(const Duration(seconds: 5));
-          if (response.statusCode == 200) {
-            final data = jsonDecode(response.body);
-            final List<dynamic> busesData = data is List
-                ? data
-                : data['data'] ?? [];
-
-            return busesData.map((bus) {
-              try {
-                final jsonMap = bus is Map<String, dynamic> ? bus : (bus is String ? jsonDecode(bus) as Map<String, dynamic> : <String, dynamic>{});
-                // Let BusLocation.fromJson handle parsing (including ETA fields)
-                return BusLocation.fromJson(jsonMap);
-              } catch (e) {
-                // Fallback to best-effort mapping
-                final busMap = bus is Map<String, dynamic> ? bus : {};
-                final busNumber = busMap['busNumber']?.toString() ?? 'Unknown';
-                final lat = (busMap['latitude'] ?? busMap['lat'] ?? 23.7271) as num;
-                final lng = (busMap['longitude'] ?? busMap['lng'] ?? 92.7176) as num;
-                return BusLocation(
-                  busId: 'Bus $busNumber',
-                  deviceId: busMap['deviceId'] ?? 'device-$busNumber',
-                  lat: lat.toDouble(),
-                  lng: lng.toDouble(),
-                  speed: ((busMap['speed'] ?? 0) as num).toDouble(),
-                  accuracy: ((busMap['accuracy'] ?? busMap['hdop'] ?? 1.0) as num).toDouble(),
-                  status: (busMap['status'] ?? 'idle').toString().toLowerCase(),
-                  timestamp: DateTime.now(),
-                );
-              }
-            }).toList();
-          }
-        } catch (_) {
-          // Try next endpoint
-        }
-      }
-    } catch (_) {
-      // Fallback to demo data
-    }
-
-    // Fallback: use demo data with slight random position variations
-    final demoInstance = ApiService();
-    final demoBuses = demoInstance._getDemoBuses(null);
-    final now = DateTime.now();
-
-    return demoBuses.map((bus) {
-      final busNumber = bus['busNumber'].toString();
-      var lat = (bus['latitude'] as num).toDouble();
-      var lng = (bus['longitude'] as num).toDouble();
-
-      // Add slight wobble to simulate live updates
-      if (bus['status'] == 'running') {
-        final wobble = (now.second % 10) / 10000;
-        lat += wobble;
-        lng += wobble;
-      }
-
-      return BusLocation(
-        busId: 'Bus $busNumber',
-        deviceId: 'ESP32-${busNumber.padRight(3, '0')}',
-        lat: lat,
-        lng: lng,
-        speed: ((bus['speed'] ?? 0) as num).toDouble(),
-        accuracy: 0.95,
-        status: (bus['status'] ?? 'idle').toString().toLowerCase(),
-        timestamp: now,
-      );
-    }).toList();
+    final buses = await ApiService().getBuses(token: token);
+    return buses
+        .whereType<Map<String, dynamic>>()
+        .map(BusLocation.fromJson)
+        .toList();
   }
 
   static Map<String, String> _headers([String? token]) {
@@ -283,76 +86,10 @@ class ApiService {
     return headers;
   }
 
-  Future<List<dynamic>> getAvailableDriverBuses() async {
-    try {
-      final response = await http.get(Uri.parse('$baseUrl/auth/driver/buses')).timeout(const Duration(seconds: 55));
-      if (response.statusCode != 200) throw Exception('Could not load available buses');
-      return jsonDecode(response.body) as List<dynamic>;
-    } catch (e) {
-      if (e is TimeoutException) throw Exception('Server is waking up, please wait, then retry.');
-      if (e is http.ClientException || e.toString().contains('SocketException')) throw Exception('No internet connection. Check your connection and retry.');
-      rethrow;
-    }
-  }
-
-  Future<List<dynamic>> getPendingDrivers(String token) async {
-    final response = await http.get(Uri.parse('$baseUrl/admin/drivers/pending'), headers: _headers(token)).timeout(const Duration(seconds: 10));
-    final data = jsonDecode(response.body);
-    if (response.statusCode == 200) return data as List<dynamic>;
-    throw Exception(data['error'] ?? 'Could not load pending drivers');
-  }
-
-  Future<List<dynamic>> getManagedDrivers(String token) async {
-    final responses = await Future.wait([getPendingDrivers(token), getApprovedDrivers(token)]);
-    return [...responses[0].map((d) => {...Map<String,dynamic>.from(d), 'accountStatus':'pending'}), ...responses[1].map((d) => {...Map<String,dynamic>.from(d), 'accountStatus':'approved'})];
-  }
-
-  Future<List<dynamic>> getApprovedDrivers(String token) async {
-    final response = await http.get(Uri.parse('$baseUrl/admin/drivers/approved'), headers: _headers(token)).timeout(const Duration(seconds: 10));
-    final data = jsonDecode(response.body);
-    if (response.statusCode == 200) return data as List<dynamic>;
-    throw Exception(data['error'] ?? 'Could not load active drivers');
-  }
-
-  Future<void> reviewDriver(String token, String id, String action, {int? busNumber}) async {
-    final response = await http.patch(Uri.parse('$baseUrl/admin/drivers/$id'), headers: _headers(token), body: jsonEncode({'action': action, if (busNumber != null) 'busNumber': busNumber})).timeout(const Duration(seconds: 10));
-    if (response.statusCode < 200 || response.statusCode >= 300) { final data=jsonDecode(response.body); throw Exception(data['error'] ?? 'Driver update failed'); }
-  }
-
-  Future<Map<String, dynamic>> driverLogin(String phone, String pin) async {
-    try {
-      final response = await http.post(Uri.parse('$baseUrl/auth/driver/login'), headers: _headers(), body: jsonEncode({'phone': phone, 'pin': pin})).timeout(const Duration(seconds: 55));
-      final data = jsonDecode(response.body);
-      if (response.statusCode == 200) return Map<String, dynamic>.from(data);
-      final code = data['error']?.toString() ?? 'driver_login_failed';
-      final message = data['message']?.toString() ?? data['error']?.toString() ?? 'Driver login failed';
-      throw Exception('$code|$message');
-    } catch (e) {
-      if (e is TimeoutException) throw Exception('Server is waking up, please wait, then retry.');
-      if (e is http.ClientException || e.toString().contains('SocketException')) throw Exception('No internet connection. Check your connection and retry.');
-      rethrow;
-    }
-  }
-
-  Future<Map<String, dynamic>> driverRegister(String name, String phone, String pin, int busNumber) async {
-    try {
-      final response = await http.post(Uri.parse('$baseUrl/auth/driver/register'), headers: _headers(), body: jsonEncode({'name': name, 'phone': phone, 'pin': pin, 'busNumber': busNumber})).timeout(const Duration(seconds: 55));
-      final data = jsonDecode(response.body);
-      if (response.statusCode == 201) return Map<String, dynamic>.from(data);
-      throw Exception(data['error'] ?? 'Driver registration failed');
-    } catch (e) {
-      if (e is TimeoutException) throw Exception('Server is waking up, please wait, then retry.');
-      if (e is http.ClientException || e.toString().contains('SocketException')) throw Exception('No internet connection. Check your connection and retry.');
-      rethrow;
-    }
-  }
-
-  Future<void> logout(String token) async { await http.post(Uri.parse('$baseUrl/auth/logout'), headers: _headers(token)).timeout(const Duration(seconds: 8)); }
-
-  Future<void> publishDriverLocation(String token, Map<String, dynamic> fix) async {
-    final response = await http.post(Uri.parse('$baseUrl/location'), headers: _headers(token), body: jsonEncode(fix)).timeout(const Duration(seconds: 12));
-    if (response.statusCode == 401) throw Exception('SESSION_EXPIRED');
-    if (response.statusCode < 200 || response.statusCode >= 300) throw Exception('Location update failed (${response.statusCode})');
+  Future<void> logout(String token) async {
+    await http
+        .post(Uri.parse('$baseUrl/auth/logout'), headers: _headers(token))
+        .timeout(const Duration(seconds: 8));
   }
 
   Future<Map<String, dynamic>> login(String email, String password) async {
@@ -377,6 +114,150 @@ class ApiService {
     }
   }
 
+  Future<String> forgotPassword(String email) async {
+    final response = await http
+        .post(
+          Uri.parse('$baseUrl/auth/forgot-password'),
+          headers: _headers(),
+          body: jsonEncode({'email': email.trim().toLowerCase()}),
+        )
+        .timeout(const Duration(seconds: 10));
+    final data = jsonDecode(response.body);
+    if (response.statusCode == 200 && data is Map<String, dynamic>) {
+      return data['message']?.toString() ??
+          'If this account exists, a default password has been set. Check your email format.';
+    }
+    throw Exception(
+      data is Map<String, dynamic>
+          ? data['error']?.toString() ?? 'Password reset failed'
+          : 'Password reset failed',
+    );
+  }
+
+  Future<void> changePassword(String token, String newPassword) async {
+    final response = await http
+        .post(
+          Uri.parse('$baseUrl/auth/change-password'),
+          headers: _headers(token),
+          body: jsonEncode({'newPassword': newPassword}),
+        )
+        .timeout(const Duration(seconds: 10));
+    final data = response.body.isNotEmpty ? jsonDecode(response.body) : null;
+    if (response.statusCode == 200) return;
+    throw Exception(
+      data is Map<String, dynamic>
+          ? data['error']?.toString() ?? 'Could not update password'
+          : 'Could not update password',
+    );
+  }
+
+  Future<Map<String, dynamic>> driverLogin(String phone, String pin) async {
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$baseUrl/auth/driver-login'),
+            headers: _headers(),
+            body: jsonEncode({'phone': phone, 'pin': pin}),
+          )
+          .timeout(const Duration(seconds: 60));
+      dynamic data;
+      try {
+        data = jsonDecode(response.body);
+      } on FormatException {
+        throw Exception(
+          'Driver login service returned an invalid page. Check the API URL and backend deployment, then try again.',
+        );
+      }
+      if (response.statusCode == 200 && data is Map<String, dynamic>) {
+        return data;
+      }
+      final message = data is Map<String, dynamic> ? data['error'] : null;
+      throw Exception(message ?? 'Driver login failed');
+    } on TimeoutException {
+      throw Exception(
+        'Server is waking up. Please wait a moment and try again.',
+      );
+    } on http.ClientException {
+      throw Exception(
+        'Could not reach the server. It may be waking up; please try again shortly.',
+      );
+    }
+  }
+
+  Future<Map<String, dynamic>> getDriverCurrentUser(String token) async {
+    final response = await http
+        .get(Uri.parse('$baseUrl/auth/driver/me'), headers: _headers(token))
+        .timeout(const Duration(seconds: 15));
+    final data = response.body.isNotEmpty ? jsonDecode(response.body) : null;
+    if (response.statusCode == 200 &&
+        data is Map<String, dynamic> &&
+        data['user'] is Map<String, dynamic>) {
+      return data['user'] as Map<String, dynamic>;
+    }
+    throw Exception(
+      data is Map<String, dynamic>
+          ? data['error'] ?? 'Driver session expired'
+          : 'Driver session expired',
+    );
+  }
+
+  Future<int> sendDriverLocation(Map<String, dynamic> fix, String token) async {
+    final response = await http
+        .post(
+          Uri.parse('$baseUrl/location'),
+          headers: _headers(token),
+          body: jsonEncode(fix),
+        )
+        .timeout(const Duration(seconds: 8));
+    return response.statusCode;
+  }
+
+  Stream<List<Map<String, dynamic>>> streamBusUpdates(String token) async* {
+    var retrySeconds = 1;
+    while (true) {
+      final client = http.Client();
+      try {
+        final request = http.Request('GET', Uri.parse('$baseUrl/buses/stream'))
+          ..headers.addAll(_headers(token))
+          ..headers['Accept'] = 'text/event-stream';
+        final response = await client
+            .send(request)
+            .timeout(const Duration(seconds: 60));
+        if (response.statusCode != 200) {
+          throw Exception('Bus stream returned ${response.statusCode}');
+        }
+        retrySeconds = 1;
+        final eventLines = <String>[];
+        await for (final line
+            in response.stream
+                .transform(utf8.decoder)
+                .transform(const LineSplitter())) {
+          if (line.startsWith('data:')) {
+            eventLines.add(line.substring(5).trimLeft());
+          } else if (line.isEmpty && eventLines.isNotEmpty) {
+            final decoded = jsonDecode(eventLines.join('\n'));
+            eventLines.clear();
+            if (decoded is List) {
+              yield decoded.whereType<Map<String, dynamic>>().toList();
+            }
+          }
+        }
+        await Future<void>.delayed(Duration(seconds: retrySeconds));
+        if (retrySeconds < 15) {
+          retrySeconds = retrySeconds * 2 > 15 ? 15 : retrySeconds * 2;
+        }
+      } catch (error) {
+        if (kDebugMode) debugPrint('Bus stream reconnecting: $error');
+        await Future<void>.delayed(Duration(seconds: retrySeconds));
+        if (retrySeconds < 15) {
+          retrySeconds = retrySeconds * 2 > 15 ? 15 : retrySeconds * 2;
+        }
+      } finally {
+        client.close();
+      }
+    }
+  }
+
   Future<Map<String, dynamic>> getCurrentUser(String token) async {
     final response = await http
         .get(Uri.parse('$baseUrl/me'), headers: _headers(token))
@@ -397,7 +278,7 @@ class ApiService {
 
   Future<Map<String, dynamic>> getApiRoot() async {
     final response = await http
-        .get(Uri.parse('$baseUrl'))
+        .get(Uri.parse(baseUrl))
         .timeout(const Duration(seconds: 8));
     final data = response.body.isNotEmpty
         ? jsonDecode(response.body)
@@ -438,25 +319,6 @@ class ApiService {
       }
     }
     throw Exception('Failed to load hostels');
-  }
-
-  Future<List<dynamic>> getBusesLive({String? token}) async {
-    final response = await http
-        .get(Uri.parse('$baseUrl/buses/live'), headers: _headers(token))
-        .timeout(const Duration(seconds: 8));
-    if (response.statusCode == 200) {
-      final parsed = jsonDecode(response.body);
-      if (parsed is List) return parsed;
-      if (parsed is Map<String, dynamic>) {
-        final data = parsed['data'];
-        if (data is List) return data;
-      }
-    }
-    final body = response.body.isNotEmpty ? jsonDecode(response.body) : null;
-    final message = body is Map<String, dynamic>
-        ? (body['error']?.toString() ?? 'Failed to load live buses')
-        : 'Failed to load live buses';
-    throw Exception(message);
   }
 
   Future<List<dynamic>> getTelemetryDiagnostics({
@@ -529,53 +391,146 @@ class ApiService {
       if (response.statusCode == 200 || response.statusCode == 201) return data;
       throw Exception(data['error'] ?? 'Registration failed');
     } catch (e) {
-      throw Exception('Registration failed: $e');
+      if (e is TimeoutException || e is http.ClientException) {
+        throw Exception('Could not reach the registration server. Try again.');
+      }
+      rethrow;
     }
   }
 
   Future<List<dynamic>> getBuses({String? hostel, String? token}) async {
-    final candidateUrls = <String>[
-      hostel != null ? '$baseUrl/buses?hostel=$hostel' : '$baseUrl/buses',
-      hostel != null ? '$baseUrl/all-buses?hostel=$hostel' : '$baseUrl/all-buses',
-      '$baseUrl/buses/live',
-    ];
+    if (token == null || token.isEmpty) {
+      throw Exception('Not logged in. Sign in again to load buses.');
+    }
 
-    for (final url in candidateUrls) {
-      try {
-        if (kDebugMode) debugPrint('Fetching buses: $url');
-        final response = await http
-            .get(Uri.parse(url), headers: _headers(token))
-            .timeout(const Duration(seconds: 45));
+    final query = hostel == null
+        ? ''
+        : '?hostel=${Uri.encodeQueryComponent(hostel)}';
+    final endpoints = ['$baseUrl/buses$query', '$baseUrl/all-buses$query'];
+    Object? lastError;
+    var requestCount = 0;
 
-        if (kDebugMode) {
-          debugPrint('Buses response ${response.statusCode} for $url: ${response.body}');
+    for (
+      var endpointIndex = 0;
+      endpointIndex < endpoints.length && requestCount < 3;
+      endpointIndex++
+    ) {
+      final url = endpoints[endpointIndex];
+      var endpointRetries = 0;
+      var retryCurrentEndpoint = true;
+      while (retryCurrentEndpoint && requestCount < 3) {
+        requestCount++;
+        retryCurrentEndpoint = false;
+        final timeout = Duration(seconds: requestCount == 1 ? 60 : 15);
+        http.Response response;
+        try {
+          response = await http
+              .get(Uri.parse(url), headers: _headers(token))
+              .timeout(timeout);
+        } on TimeoutException {
+          lastError = Exception(
+            'Server request timed out after ${timeout.inSeconds}s',
+          );
+          if (kDebugMode) {
+            debugPrint('Bus fetch timeout for $url (${timeout.inSeconds}s)');
+          }
+          if (endpointRetries == 0 && requestCount < 3) {
+            endpointRetries++;
+            await Future<void>.delayed(const Duration(seconds: 1));
+            retryCurrentEndpoint = true;
+            continue;
+          }
+          break;
+        } on http.ClientException catch (error) {
+          lastError = Exception('Network error: ${error.message}');
+          if (kDebugMode) {
+            debugPrint('Bus fetch network error for $url: ${error.message}');
+          }
+          if (endpointRetries == 0 && requestCount < 3) {
+            endpointRetries++;
+            await Future<void>.delayed(const Duration(seconds: 1));
+            retryCurrentEndpoint = true;
+            continue;
+          }
+          break;
         }
 
         if (response.statusCode == 200) {
           final decoded = jsonDecode(response.body);
-          final items = decoded is List ? decoded : (decoded is Map ? decoded['data'] ?? decoded['buses'] ?? [] : const <dynamic>[]);
-          if (items is! List) {
-            throw const FormatException('Unexpected buses response format');
-          }
-          return List<dynamic>.from(items);
+          final items = decoded is List
+              ? decoded
+              : decoded is Map<String, dynamic>
+              ? decoded['data'] ?? decoded['buses']
+              : null;
+          if (items is List) return List<dynamic>.from(items);
+          lastError = const FormatException('Unexpected buses response format');
+          _logBusFetchFailure(url, response, lastError);
+          break;
         }
 
-        if (response.statusCode == 404 && url != candidateUrls.last) {
+        _logBusFetchFailure(url, response, 'HTTP ${response.statusCode}');
+        final decoded = response.body.isEmpty
+            ? null
+            : _tryDecodeJson(response.body);
+        final serverMessage = decoded is Map<String, dynamic>
+            ? decoded['error']?.toString()
+            : null;
+        if (response.statusCode == 401) {
+          throw Exception(
+            serverMessage ?? 'Session expired. Please sign in again.',
+          );
+        }
+        if (response.statusCode == 403) {
+          throw Exception(
+            serverMessage ?? 'You are not allowed to view these buses.',
+          );
+        }
+
+        lastError = Exception(
+          serverMessage ??
+              'Bus request failed with HTTP ${response.statusCode}',
+        );
+        if (response.statusCode == 404 &&
+            endpointIndex + 1 < endpoints.length) {
+          break;
+        }
+        if (response.statusCode >= 500 &&
+            endpointRetries == 0 &&
+            requestCount < 3) {
+          endpointRetries++;
+          await Future<void>.delayed(const Duration(seconds: 1));
+          retryCurrentEndpoint = true;
           continue;
         }
-
-        final body = response.body.isNotEmpty ? jsonDecode(response.body) : null;
-        final message = body is Map<String, dynamic>
-            ? (body['error']?.toString() ?? 'Failed to load buses')
-            : 'Failed to load buses';
-        throw Exception(message);
-      } catch (e) {
-        if (kDebugMode) debugPrint('Bus-list fetch failed for $url: $e');
-        if (url == candidateUrls.last) rethrow;
+        break;
       }
     }
 
-    throw const FormatException('No bus data source was available');
+    throw Exception(
+      lastError?.toString() ?? 'Could not load buses. Please retry.',
+    );
+  }
+
+  static dynamic _tryDecodeJson(String body) {
+    try {
+      return jsonDecode(body);
+    } on FormatException {
+      return null;
+    }
+  }
+
+  static void _logBusFetchFailure(
+    String url,
+    http.Response response,
+    Object error,
+  ) {
+    if (!kDebugMode) return;
+    final body = response.body.length > 600
+        ? '${response.body.substring(0, 600)}…'
+        : response.body;
+    debugPrint(
+      'Bus fetch failed: $url -> ${response.statusCode}; $error; body=$body',
+    );
   }
 
   Future<Map<String, dynamic>?> getBus(int busNumber, {String? token}) async {
@@ -590,6 +545,28 @@ class ApiService {
     final demo = _getDemoBuses(null);
     return demo.firstWhere((b) => b['busNumber'] == busNumber, orElse: () => {})
         as Map<String, dynamic>?;
+  }
+
+  Future<List<dynamic>> getTodayScheduledBuses({
+    required String token,
+    DateTime? date,
+  }) async {
+    final day = date ?? DateTime.now();
+    final dateText =
+        '${day.year.toString().padLeft(4, '0')}-${day.month.toString().padLeft(2, '0')}-${day.day.toString().padLeft(2, '0')}';
+    final response = await http
+        .get(
+          Uri.parse('$baseUrl/today-buses?date=$dateText'),
+          headers: _headers(token),
+        )
+        .timeout(const Duration(seconds: 10));
+    final data = jsonDecode(response.body);
+    if (response.statusCode == 200 && data is List) return data;
+    throw Exception(
+      data is Map<String, dynamic>
+          ? data['error']?.toString() ?? 'Could not load today’s buses'
+          : 'Could not load today’s buses',
+    );
   }
 
   Future<List<dynamic>> getSchedules({
@@ -664,6 +641,7 @@ class ApiService {
     required String assignedHostel,
     required String driverName,
     required String driverPhone,
+    required String pin,
     required String token,
   }) async {
     final response = await http
@@ -675,6 +653,7 @@ class ApiService {
             'assignedHostel': assignedHostel,
             'driverName': driverName,
             'driverPhone': driverPhone,
+            'pin': pin,
           }),
         )
         .timeout(const Duration(seconds: 10));
@@ -696,12 +675,17 @@ class ApiService {
     required String driverName,
     required String driverPhone,
     required String token,
+    String? pin,
   }) async {
     final response = await http
         .patch(
           Uri.parse('$baseUrl/buses/$busNumber/driver'),
           headers: _headers(token),
-          body: jsonEncode({'name': driverName, 'phone': driverPhone}),
+          body: jsonEncode({
+            'driverName': driverName,
+            'driverPhone': driverPhone,
+            if (pin != null && pin.isNotEmpty) 'pin': pin,
+          }),
         )
         .timeout(const Duration(seconds: 10));
 
@@ -1028,10 +1012,11 @@ class ApiService {
         '5:30 PM',
       ),
     ];
-    if (hostelFilter != null)
+    if (hostelFilter != null) {
       return allBuses
           .where((b) => b['assignedHostel'] == hostelFilter)
           .toList();
+    }
     return allBuses;
   }
 

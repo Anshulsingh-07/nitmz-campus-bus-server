@@ -4,8 +4,6 @@ import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 
 class LocationService {
-  StreamSubscription<Position>? _sub;
-
   /// Request permission and get current position once.
   static Future<Position?> requestPermissionAndGetLocation() async {
     bool serviceEnabled;

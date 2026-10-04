@@ -12,6 +12,7 @@ class BusModel {
   final DriverModel? driver;
   final ScheduleModel? schedule;
   final String route;
+  final DateTime? lastUpdated;
 
   static const Map<String, List<double>> _knownHostelCoordinates = {
     'BH1': [23.792917, 92.727789],
@@ -37,6 +38,7 @@ class BusModel {
     this.driver,
     this.schedule,
     this.route = 'Hostel ↔ MBSE',
+    this.lastUpdated,
   });
 
   factory BusModel.fromJson(Map<String, dynamic> json) {
@@ -55,6 +57,9 @@ class BusModel {
           ? ScheduleModel.fromJson(json['schedule'])
           : null,
       route: json['route'] ?? 'Hostel ↔ MBSE',
+      lastUpdated: json['lastUpdated'] == null
+          ? null
+          : DateTime.tryParse(json['lastUpdated'].toString()),
     );
   }
 
@@ -323,6 +328,7 @@ class UserModel {
   final String? hostelId;
   final String? phone;
   final int? busNumber;
+  bool mustChangePassword;
   String? token;
 
   UserModel({
@@ -333,6 +339,7 @@ class UserModel {
     this.hostelId,
     this.phone,
     this.busNumber,
+    this.mustChangePassword = false,
     this.token,
   });
 
@@ -345,11 +352,13 @@ class UserModel {
       hostelId: json['hostelId'],
       phone: json['phone']?.toString(),
       busNumber: (json['busNumber'] as num?)?.toInt(),
+      mustChangePassword: json['mustChangePassword'] == true,
       token: json['token'],
     );
   }
 
   bool get isAdmin => role == 'admin' || role == 'caretaker';
+  bool get isDriver => role == 'driver';
 }
 
 class HostelModel {

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import os
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -12,7 +13,7 @@ def add_cors_headers(response):
     return response
 
 # --- Configuration (Must match ESP32 firmware) ---
-API_SECRET_KEY = "BUSTRACKESP1SECRETKEY"
+API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "")
 API_PATH = "/api/update-location"
 LATEST_PATH = "/api/location/latest"
 
@@ -36,7 +37,7 @@ def update_location():
     client_key = request.headers.get("x-api-key")
 
     if client_key != API_SECRET_KEY:
-        print(f"[!] Unauthorized access attempt. Key provided: {client_key}")
+        print("[!] Unauthorized access attempt")
         return jsonify({"error": "Unauthorized"}), 401
 
     try:

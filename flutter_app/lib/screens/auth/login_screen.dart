@@ -6,6 +6,7 @@ import '../../models/models.dart';
 import '../student/student_home.dart';
 import '../admin/admin_home.dart';
 import '../driver/driver_home.dart';
+import 'password_change_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -19,15 +20,13 @@ class _LoginScreenState extends State<LoginScreen>
   final _emailCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
   bool _isAdmin = false;
-  bool _obscurePass = true;
-  bool _isRegister = false;
-  final _nameCtrl = TextEditingController();
+  bool _driverMode = false;
   final _phoneCtrl = TextEditingController();
   final _pinCtrl = TextEditingController();
-  final _confirmPinCtrl = TextEditingController();
-  bool _driverMode = false;
-  int? _busNumber;
-  Future<List<dynamic>>? _availableBuses;
+  bool _obscurePass = true;
+  bool _isRegister = false;
+  bool _isResettingPassword = false;
+  final _nameCtrl = TextEditingController();
   String _selectedHostel = 'BH1';
   late AnimationController _animCtrl;
   late Animation<Offset> _slideAnim;
@@ -53,13 +52,13 @@ class _LoginScreenState extends State<LoginScreen>
     _nameCtrl.dispose();
     _phoneCtrl.dispose();
     _pinCtrl.dispose();
-    _confirmPinCtrl.dispose();
     _animCtrl.dispose();
     super.dispose();
   }
 
   void _toggleRole(bool isAdmin) {
     setState(() {
+      _driverMode = false;
       _isAdmin = isAdmin;
       _emailCtrl.clear();
       _passCtrl.clear();
@@ -70,35 +69,24 @@ class _LoginScreenState extends State<LoginScreen>
     final auth = context.read<AuthService>();
     final api = context.read<ApiService>();
     if (_driverMode) {
-      final phone = _phoneCtrl.text.replaceAll(RegExp(r'\D'), '');
-      if (!RegExp(r'^[6-9]\d{9}$').hasMatch(phone)) { auth.setError('Enter a valid 10-digit Indian mobile number'); return; }
-      if (!RegExp(r'^\d{6}$').hasMatch(_pinCtrl.text)) { auth.setError('PIN must contain 6 digits'); return; }
-      if (_isRegister) {
-        if (_nameCtrl.text.trim().isEmpty || _pinCtrl.text != _confirmPinCtrl.text || _busNumber == null) { auth.setError('Enter your name, matching PINs, and choose a bus'); return; }
-        final result = await auth.driverRegister(_nameCtrl.text.trim(), phone, _pinCtrl.text, _busNumber!, api);
-        if (result == 'pending' && mounted) {
-          setState(() { _isRegister = false; });
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'Registration submitted. A caretaker will review and approve your account. You\'ll be notified once approved.',
-              ),
-            ),
-          );
-        }
-      } else {
-        final success = await auth.driverLogin(phone, _pinCtrl.text, api);
-        if (success && mounted) {
-          Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const DriverHomeScreen()));
-        } else if (mounted && auth.error != null) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(auth.error!)),
-          );
-        }
+      final enteredPhone = _phoneCtrl.text.replaceAll(RegExp(r'\D'), '');
+      final phone = enteredPhone.length > 10
+          ? enteredPhone.substring(enteredPhone.length - 10)
+          : enteredPhone;
+      if (!RegExp(r'^[6-9]\d{9}$').hasMatch(phone) ||
+          !RegExp(r'^\d{6}$').hasMatch(_pinCtrl.text)) {
+        auth.setError('Enter a valid 10-digit mobile number and 6-digit PIN');
+        return;
+      }
+      final success = await auth.driverLogin(phone, _pinCtrl.text, api);
+      if (success && mounted) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const DriverHomeScreen()),
+        );
       }
       return;
     }
-
     if (_isRegister) {
       final success = await auth.register(
         _nameCtrl.text.trim(),
@@ -125,17 +113,48 @@ class _LoginScreenState extends State<LoginScreen>
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
-          builder: (_) =>
-              auth.isAdmin ? const AdminHome() : const StudentHome(),
+          builder: (_) => auth.currentUser?.mustChangePassword == true
+              ? const PasswordChangeScreen()
+              : auth.isAdmin
+              ? const AdminHome()
+              : const StudentHome(),
         ),
       );
+    }
+  }
+
+  Future<void> _forgotPassword() async {
+    final email = _emailCtrl.text.trim();
+    if (email.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter your college email first.')),
+      );
+      return;
+    }
+    setState(() => _isResettingPassword = true);
+    try {
+      final message = await context.read<ApiService>().forgotPassword(email);
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(message)));
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(error.toString().replaceFirst('Exception: ', '')),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isResettingPassword = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final auth = context.watch<AuthService>();
-    if (_driverMode) return _buildDriverBody(auth);
     final size = MediaQuery.of(context).size;
 
     return Scaffold(
@@ -179,44 +198,6 @@ class _LoginScreenState extends State<LoginScreen>
                 ),
                 const SizedBox(height: 32),
 
-                  Container(
-                    margin: const EdgeInsets.symmetric(horizontal: 32),
-                    padding: const EdgeInsets.all(4),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.2),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Row(
-                      children: [
-                        Expanded(child: _roleBtn('Student / Staff', false)),
-                        Expanded(
-                          child: GestureDetector(
-                            onTap: () => setState(() {
-                              _driverMode = true;
-                              _isRegister = false;
-                              _isAdmin = false;
-                              _availableBuses = context
-                                  .read<ApiService>()
-                                  .getAvailableDriverBuses();
-                            }),
-                            child: const Padding(
-                              padding: EdgeInsets.symmetric(vertical: 10),
-                              child: Center(
-                                child: Text(
-                                  'Driver',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                const SizedBox(height: 12),
                 // Role Toggle
                 Container(
                   margin: const EdgeInsets.symmetric(horizontal: 32),
@@ -229,6 +210,7 @@ class _LoginScreenState extends State<LoginScreen>
                     children: [
                       Expanded(child: _roleBtn('Student', false)),
                       Expanded(child: _roleBtn('Caretaker', true)),
+                      Expanded(child: _driverRoleBtn()),
                     ],
                   ),
                 ),
@@ -257,7 +239,9 @@ class _LoginScreenState extends State<LoginScreen>
                         Row(
                           children: [
                             Icon(
-                              _isAdmin
+                              _driverMode
+                                  ? Icons.directions_bus
+                                  : _isAdmin
                                   ? Icons.admin_panel_settings
                                   : Icons.school,
                               color: const Color(0xFF1565C0),
@@ -265,7 +249,9 @@ class _LoginScreenState extends State<LoginScreen>
                             ),
                             const SizedBox(width: 10),
                             Text(
-                              _isRegister
+                              _driverMode
+                                  ? 'Driver Login'
+                                  : _isRegister
                                   ? 'Create Account'
                                   : (_isAdmin
                                         ? 'Caretaker Login'
@@ -280,21 +266,51 @@ class _LoginScreenState extends State<LoginScreen>
                         ),
                         const SizedBox(height: 20),
 
-                        if (_isRegister) ...[
-                          _buildField('Full Name', Icons.person, _nameCtrl),
+                        if (_driverMode) ...[
+                          _buildField(
+                            'Mobile Number',
+                            Icons.phone,
+                            _phoneCtrl,
+                            inputType: TextInputType.phone,
+                          ),
                           const SizedBox(height: 14),
+                          _buildPinField(),
+                          const SizedBox(height: 14),
+                        ] else ...[
+                          if (_isRegister) ...[
+                            _buildField('Full Name', Icons.person, _nameCtrl),
+                            const SizedBox(height: 14),
+                          ],
+                          _buildField(
+                            'Email Address',
+                            Icons.email,
+                            _emailCtrl,
+                            inputType: TextInputType.emailAddress,
+                          ),
+                          const SizedBox(height: 14),
+                          _buildPasswordField(),
+                          const SizedBox(height: 14),
+                          if (!_isRegister)
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: TextButton(
+                                onPressed: _isResettingPassword
+                                    ? null
+                                    : _forgotPassword,
+                                child: _isResettingPassword
+                                    ? const SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : const Text('Forgot password?'),
+                              ),
+                            ),
+                          if (_isRegister) _buildHostelDropdown(),
+                          if (_isRegister) const SizedBox(height: 14),
                         ],
-                        _buildField(
-                          'Email Address',
-                          Icons.email,
-                          _emailCtrl,
-                          inputType: TextInputType.emailAddress,
-                        ),
-                        const SizedBox(height: 14),
-                        _buildPasswordField(),
-                        const SizedBox(height: 14),
-                        if (_isRegister) _buildHostelDropdown(),
-                        if (_isRegister) const SizedBox(height: 14),
 
                         const SizedBox(height: 20),
 
@@ -331,7 +347,9 @@ class _LoginScreenState extends State<LoginScreen>
                                     ),
                                   )
                                 : Text(
-                                    _isRegister ? 'Register' : 'Login',
+                                    _driverMode
+                                        ? 'Driver Login'
+                                        : (_isRegister ? 'Register' : 'Login'),
                                     style: const TextStyle(
                                       fontSize: 16,
                                       fontWeight: FontWeight.bold,
@@ -341,7 +359,7 @@ class _LoginScreenState extends State<LoginScreen>
                         ),
                         const SizedBox(height: 14),
 
-                        if (!_isAdmin)
+                        if (!_isAdmin && !_driverMode)
                           Center(
                             child: TextButton(
                               onPressed: () => setState(() {
@@ -378,12 +396,8 @@ class _LoginScreenState extends State<LoginScreen>
     );
   }
 
-  Widget _buildDriverBody(AuthService auth) {
-    return Scaffold(backgroundColor: const Color(0xFFF6F6F6), appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white, title: const Text('Driver access'), leading: IconButton(icon: const Icon(Icons.arrow_back), onPressed: () => setState(() { _driverMode = false; _isRegister = false; }))), body: SafeArea(child: Center(child: SingleChildScrollView(padding: const EdgeInsets.all(24), child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 440), child: Card(elevation: 2, child: Padding(padding: const EdgeInsets.all(24), child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [const Icon(Icons.directions_bus, size: 40, color: Colors.black), const SizedBox(height: 12), Text(_isRegister ? 'Create driver account' : 'Driver login', textAlign: TextAlign.center, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)), const SizedBox(height: 20), if (_isRegister) TextField(controller: _nameCtrl, textCapitalization: TextCapitalization.words, autofillHints: const [AutofillHints.name], decoration: const InputDecoration(labelText: 'Full name', border: OutlineInputBorder())), if (_isRegister) const SizedBox(height: 12), TextField(controller: _phoneCtrl, keyboardType: TextInputType.phone, autofillHints: const [AutofillHints.telephoneNumber], maxLength: 10, decoration: const InputDecoration(prefixText: '+91 ', labelText: 'Mobile number', border: OutlineInputBorder())), const SizedBox(height: 8), TextField(controller: _pinCtrl, keyboardType: TextInputType.number, obscureText: _obscurePass, maxLength: 6, autofillHints: [_isRegister ? AutofillHints.newPassword : AutofillHints.password], decoration: InputDecoration(labelText: '6-digit PIN', border: const OutlineInputBorder(), suffixIcon: IconButton(onPressed: () => setState(() => _obscurePass = !_obscurePass), icon: Icon(_obscurePass ? Icons.visibility_off : Icons.visibility)))), if (_isRegister) ...[const SizedBox(height: 8), TextField(controller: _confirmPinCtrl, keyboardType: TextInputType.number, obscureText: _obscurePass, maxLength: 6, decoration: const InputDecoration(labelText: 'Confirm PIN', border: OutlineInputBorder())), const SizedBox(height: 8), FutureBuilder<List<dynamic>>(future: _availableBuses ??= context.read<ApiService>().getAvailableDriverBuses(), builder: (context, snapshot) { final buses = snapshot.data ?? []; return DropdownButtonFormField<int>(value: _busNumber, decoration: const InputDecoration(labelText: 'Available bus', border: OutlineInputBorder()), items: buses.map((b) => DropdownMenuItem<int>(value: (b['busNumber'] as num).toInt(), child: Text('Bus ${b['busNumber']} · ${b['route'] ?? 'Campus route'}'))).toList(), onChanged: (v) => setState(() => _busNumber = v), hint: Text(snapshot.hasError ? 'Could not load buses' : 'Choose an unassigned bus')); })], if (auth.error != null) Padding(padding: const EdgeInsets.symmetric(vertical: 14), child: Text(auth.error!, style: const TextStyle(color: Colors.red))), const SizedBox(height: 8), SizedBox(height: 50, child: FilledButton(onPressed: auth.isLoading ? null : _handleLogin, style: FilledButton.styleFrom(backgroundColor: Colors.black), child: auth.isLoading ? const SizedBox(width: 22,height: 22,child: CircularProgressIndicator(color: Colors.white,strokeWidth: 2)) : Text(_isRegister ? 'Register' : 'Login'))), TextButton(onPressed: auth.isLoading ? null : () => setState(() { _isRegister = !_isRegister; auth.clearError(); }), child: Text(_isRegister ? 'Already registered? Login' : 'Register as a driver'))]))))))));
-  }
-
   Widget _roleBtn(String label, bool isAdmin) {
-    final selected = _isAdmin == isAdmin;
+    final selected = !_driverMode && _isAdmin == isAdmin;
     return GestureDetector(
       onTap: () => _toggleRole(isAdmin),
       child: AnimatedContainer(
@@ -404,6 +418,43 @@ class _LoginScreenState extends State<LoginScreen>
             const SizedBox(width: 6),
             Text(
               label,
+              style: TextStyle(
+                fontWeight: FontWeight.w600,
+                color: selected ? const Color(0xFF1565C0) : Colors.white,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _driverRoleBtn() {
+    final selected = _driverMode;
+    return GestureDetector(
+      onTap: () => setState(() {
+        _driverMode = true;
+        _isRegister = false;
+        context.read<AuthService>().clearError();
+      }),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(vertical: 10),
+        decoration: BoxDecoration(
+          color: selected ? Colors.white : Colors.transparent,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.directions_bus,
+              size: 18,
+              color: selected ? const Color(0xFF1565C0) : Colors.white,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              'Driver',
               style: TextStyle(
                 fontWeight: FontWeight.w600,
                 color: selected ? const Color(0xFF1565C0) : Colors.white,
@@ -473,6 +524,30 @@ class _LoginScreenState extends State<LoginScreen>
           horizontal: 16,
           vertical: 14,
         ),
+      ),
+    );
+  }
+
+  Widget _buildPinField() {
+    return TextField(
+      controller: _pinCtrl,
+      keyboardType: TextInputType.number,
+      maxLength: 6,
+      obscureText: _obscurePass,
+      decoration: InputDecoration(
+        labelText: '6-digit PIN',
+        counterText: '',
+        prefixIcon: const Icon(Icons.lock, color: Color(0xFF1565C0), size: 20),
+        suffixIcon: IconButton(
+          icon: Icon(
+            _obscurePass ? Icons.visibility_off : Icons.visibility,
+            size: 20,
+          ),
+          onPressed: () => setState(() => _obscurePass = !_obscurePass),
+        ),
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+        filled: true,
+        fillColor: const Color(0xFFF8F9FA),
       ),
     );
   }

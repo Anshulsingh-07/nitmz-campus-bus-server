@@ -67,7 +67,6 @@ class _StudentHomeState extends State<StudentHome> {
 
   @override
   Widget build(BuildContext context) {
-    final auth = context.watch<AuthService>();
     final notif = context.watch<NotificationService>();
 
     return Scaffold(
@@ -134,6 +133,31 @@ class _StudentDashboard extends StatelessWidget {
         .where((b) => b.status == 'running')
         .toList();
     final now = DateTime.now();
+    final todayKey = _dateKey(now);
+    final todaySchedules =
+        bus.schedules.where((s) => s.date.startsWith(todayKey)).toList()
+          ..sort((a, b) => a.fromHostelTime.compareTo(b.fromHostelTime));
+    // A bus scheduled for today but not yet moving stays in Today's Schedule,
+    // with its departure time visible; only moving buses appear in Running now.
+    final scheduledToday = todaySchedules
+        .where((s) => bus.getBusByNumber(s.busNumber)?.status != 'running')
+        .map((s) => _withSchedule(bus.getBusByNumber(s.busNumber), s))
+        .whereType<BusModel>()
+        .toList();
+    final futureSchedules =
+        bus.schedules
+            .where((s) => _scheduleDateTime(s)?.isAfter(now) == true)
+            .toList()
+          ..sort(
+            (a, b) => _scheduleDateTime(a)!.compareTo(_scheduleDateTime(b)!),
+          );
+    final nextSchedule = futureSchedules.isEmpty ? null : futureSchedules.first;
+    final nextBus = nextSchedule == null
+        ? null
+        : _withSchedule(
+            bus.getBusByNumber(nextSchedule.busNumber),
+            nextSchedule,
+          );
     final greeting = now.hour < 12
         ? 'Good Morning'
         : now.hour < 17
@@ -145,11 +169,10 @@ class _StudentDashboard extends StatelessWidget {
       body: RefreshIndicator(
         onRefresh: () async {
           final api = context.read<ApiService>();
-          await context.read<BusService>().loadBuses(
-            api,
-            hostel: hostel,
-            token: auth.currentUser?.token,
-          );
+          final busService = context.read<BusService>();
+          final token = auth.currentUser?.token;
+          await busService.loadBuses(api, hostel: hostel, token: token);
+          await busService.loadSchedules(api, hostel: hostel, token: token);
         },
         child: CustomScrollView(
           slivers: [
@@ -315,7 +338,7 @@ class _StudentDashboard extends StatelessWidget {
                           ),
                           SizedBox(width: 6),
                           Text(
-                            'Live Buses',
+                            'Running now',
                             style: TextStyle(
                               fontSize: 16,
                               fontWeight: FontWeight.bold,
@@ -373,25 +396,57 @@ class _StudentDashboard extends StatelessWidget {
                           child: CircularProgressIndicator(),
                         ),
                       )
-                    else if (hostelBuses.isEmpty)
+                    else if (scheduledToday.isEmpty)
                       _EmptyState()
                     else
-                      ...hostelBuses.map(
+                      ...scheduledToday.map(
                         (b) => Padding(
                           padding: const EdgeInsets.only(bottom: 10),
                           child: BusCard(
                             bus: b,
                             compact: false,
-                            onStartRoute: b.status == 'running'
-                                ? () => Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => MapScreen(selectedBus: b),
-                                    ),
-                                  )
-                                : null,
+                            onStartRoute: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => MapScreen(selectedBus: b),
+                              ),
+                            ),
                           ),
                         ),
+                      ),
+                    const SizedBox(height: 16),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Upcoming',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        TextButton.icon(
+                          onPressed: () =>
+                              _showScheduleCalendar(context, bus.schedules),
+                          icon: const Icon(Icons.calendar_month),
+                          label: const Text('Calendar'),
+                        ),
+                      ],
+                    ),
+                    if (nextBus != null)
+                      BusCard(
+                        bus: nextBus,
+                        onStartRoute: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => MapScreen(selectedBus: nextBus),
+                          ),
+                        ),
+                      )
+                    else
+                      const Text(
+                        'No upcoming departures are scheduled.',
+                        style: TextStyle(color: Colors.grey),
                       ),
                     SizedBox(
                       height: MediaQuery.of(context).padding.bottom + 80,
@@ -444,6 +499,90 @@ class _StudentDashboard extends StatelessWidget {
   }
 }
 
+String _dateKey(DateTime date) =>
+    '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+
+DateTime? _scheduleDateTime(ScheduleModel schedule) {
+  final date = DateTime.tryParse(schedule.date);
+  final match = RegExp(
+    r'^(\d{1,2}):(\d{2})\s*(AM|PM)$',
+    caseSensitive: false,
+  ).firstMatch(schedule.fromHostelTime.trim());
+  if (date == null || match == null) return null;
+  var hour = int.parse(match.group(1)!);
+  final minute = int.parse(match.group(2)!);
+  if (match.group(3)!.toUpperCase() == 'PM' && hour != 12) hour += 12;
+  if (match.group(3)!.toUpperCase() == 'AM' && hour == 12) hour = 0;
+  return DateTime(date.year, date.month, date.day, hour, minute);
+}
+
+BusModel? _withSchedule(BusModel? bus, ScheduleModel schedule) => bus == null
+    ? null
+    : BusModel(
+        busNumber: bus.busNumber,
+        assignedHostel: bus.assignedHostel,
+        status: bus.status,
+        latitude: bus.latitude,
+        longitude: bus.longitude,
+        speed: bus.speed,
+        isEnabled: bus.isEnabled,
+        driver: bus.driver,
+        schedule: schedule,
+        route: bus.route,
+        lastUpdated: bus.lastUpdated,
+      );
+
+Future<void> _showScheduleCalendar(
+  BuildContext context,
+  List<ScheduleModel> schedules,
+) async {
+  var date = DateTime.now();
+  final selected = await showDatePicker(
+    context: context,
+    initialDate: date,
+    firstDate: DateTime.now().subtract(const Duration(days: 365)),
+    lastDate: DateTime.now().add(const Duration(days: 365)),
+  );
+  if (selected == null || !context.mounted) return;
+  date = selected;
+  final entries = schedules
+      .where((s) => s.date.startsWith(_dateKey(date)))
+      .toList();
+  await showDialog<void>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: Text('Schedule • ${_dateKey(date)}'),
+      content: SizedBox(
+        width: 380,
+        child: entries.isEmpty
+            ? const Text(
+                'No schedule changes or departures are listed for this date.',
+              )
+            : ListView(
+                shrinkWrap: true,
+                children: entries
+                    .map(
+                      (s) => ListTile(
+                        leading: const Icon(Icons.directions_bus),
+                        title: Text('Bus ${s.busNumber}'),
+                        subtitle: Text(
+                          '${s.fromHostelTime} • ${s.fromMBSETime}${s.specialNote.isEmpty ? '' : '\n${s.specialNote}'}',
+                        ),
+                      ),
+                    )
+                    .toList(),
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
+    ),
+  );
+}
+
 class _EmptyState extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
@@ -478,11 +617,12 @@ class _LogoutButton extends StatelessWidget {
       icon: const Icon(Icons.logout, color: Colors.white),
       onPressed: () async {
         await context.read<AuthService>().logout();
-        if (context.mounted)
+        if (context.mounted) {
           Navigator.pushReplacement(
             context,
             MaterialPageRoute(builder: (_) => const LoginScreen()),
           );
+        }
       },
     );
   }

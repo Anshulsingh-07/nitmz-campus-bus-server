@@ -1,26 +1,24 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:provider/provider.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'config/app_config.dart';
 import 'services/api_service.dart';
 import 'services/auth_service.dart';
 import 'services/bus_service.dart';
 import 'services/notification_service.dart';
-import 'controllers/map_navigation_controller.dart';
 import 'screens/splash_screen.dart';
 
 void main() async {
   runZonedGuarded(
     () async {
       WidgetsFlutterBinding.ensureInitialized();
-      try {
-        await dotenv.load(fileName: '.env');
-      } catch (e) {
-        // Continue even if .env load fails (app can still use defaults)
-        // Print warning for debugging in development.
-        // In production, ensure the .env file is present or provide env vars.
-        // ignore: avoid_print
-        print('Warning: failed to load .env: $e');
+      if (AppConfig.supabaseUrl.isNotEmpty &&
+          AppConfig.supabasePublishableKey.isNotEmpty) {
+        await Supabase.initialize(
+          url: AppConfig.supabaseUrl,
+          publishableKey: AppConfig.supabasePublishableKey,
+        );
       }
 
       // Global error handling to surface uncaught errors while debugging.
@@ -96,7 +94,7 @@ class CampusBusTrackerApp extends StatelessWidget {
             seedColor: const Color(0xFF1565C0),
             primary: const Color(0xFF1565C0),
             secondary: const Color(0xFF42A5F5),
-            background: const Color(0xFFF5F7FA),
+            surface: const Color(0xFFF5F7FA),
           ),
           fontFamily: 'Roboto',
           appBarTheme: const AppBarTheme(

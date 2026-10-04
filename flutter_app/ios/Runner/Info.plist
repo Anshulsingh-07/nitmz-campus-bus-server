@@ -46,12 +46,12 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Your location is used to show a route from you to the selected bus and to share your bus location while a trip is active.</string>
+	<string>Your location is used to show a route from you to the selected bus and, while a driver trip is active, to share that bus's live position.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>Your location is shared with campus bus tracker while your driver trip is active, including when the screen is off.</string>
+	<string>When you start a driver trip, location is shared with campus bus tracker while the app is in the background so students can see the bus position.</string>
 	<key>UIBackgroundModes</key>
 	<array><string>location</string></array>
 	<key>GMSApiKey</key>
-	<string>AIzaSyAOVYRIgupAurZup5y1PRh8Ismb1A3lLao</string>
+	<string>$(MAPS_API_KEY)</string>
 </dict>
 </plist>

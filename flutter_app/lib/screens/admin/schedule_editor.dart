@@ -19,7 +19,6 @@ class _ScheduleEditorState extends State<ScheduleEditor> {
   @override
   Widget build(BuildContext context) {
     final bus = context.watch<BusService>();
-    final auth = context.watch<AuthService>();
 
     var buses = _selectedHostel != null
         ? bus.getBusesByHostel(_selectedHostel!)
@@ -35,6 +34,7 @@ class _ScheduleEditorState extends State<ScheduleEditor> {
             onPressed: () async {
               final picked = await showDatePicker(
                 context: context,
+                locale: const Locale('en', 'GB'),
                 initialDate: _selectedDate,
                 firstDate: DateTime.now().subtract(const Duration(days: 7)),
                 lastDate: DateTime.now().add(const Duration(days: 30)),
@@ -68,7 +68,7 @@ class _ScheduleEditorState extends State<ScheduleEditor> {
                       ),
                       const SizedBox(width: 8),
                       Text(
-                        _formatDate(_selectedDate),
+                        _formatPickerDate(_selectedDate),
                         style: const TextStyle(
                           color: Colors.white,
                           fontWeight: FontWeight.w600,
@@ -107,8 +107,15 @@ class _ScheduleEditorState extends State<ScheduleEditor> {
                 : ListView.builder(
                     padding: const EdgeInsets.all(16),
                     itemCount: buses.length,
-                    itemBuilder: (_, i) =>
-                        _ScheduleRow(bus: buses[i], date: _selectedDate),
+                    itemBuilder: (_, i) => _ScheduleRow(
+                      bus: buses[i],
+                      date: _selectedDate,
+                      schedule: _scheduleFor(
+                        bus.schedules,
+                        buses[i].busNumber,
+                        _selectedDate,
+                      ),
+                    ),
                   ),
           ),
 
@@ -154,24 +161,8 @@ class _ScheduleEditorState extends State<ScheduleEditor> {
     );
   }
 
-  String _formatDate(DateTime dt) {
-    final days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-    final months = [
-      'Jan',
-      'Feb',
-      'Mar',
-      'Apr',
-      'May',
-      'Jun',
-      'Jul',
-      'Aug',
-      'Sep',
-      'Oct',
-      'Nov',
-      'Dec',
-    ];
-    return '${days[dt.weekday - 1]}, ${dt.day} ${months[dt.month - 1]} ${dt.year}';
-  }
+  String _formatPickerDate(DateTime dt) =>
+      '${dt.day.toString().padLeft(2, '0')}/${dt.month.toString().padLeft(2, '0')}/${dt.year}';
 
   void _showBulkUpdate(BuildContext context) {
     showDialog(
@@ -207,8 +198,9 @@ class _ScheduleEditorState extends State<ScheduleEditor> {
 class _ScheduleRow extends StatefulWidget {
   final BusModel bus;
   final DateTime date;
+  final ScheduleModel? schedule;
 
-  const _ScheduleRow({required this.bus, required this.date});
+  const _ScheduleRow({required this.bus, required this.date, this.schedule});
 
   @override
   State<_ScheduleRow> createState() => _ScheduleRowState();
@@ -223,10 +215,10 @@ class _ScheduleRowState extends State<_ScheduleRow> {
   void initState() {
     super.initState();
     _fromHostelCtrl = TextEditingController(
-      text: widget.bus.schedule?.fromHostelTime ?? '',
+      text: (widget.schedule ?? widget.bus.schedule)?.fromHostelTime ?? '',
     );
     _fromMBSECtrl = TextEditingController(
-      text: widget.bus.schedule?.fromMBSETime ?? '',
+      text: (widget.schedule ?? widget.bus.schedule)?.fromMBSETime ?? '',
     );
   }
 
@@ -320,19 +312,24 @@ class _ScheduleRowState extends State<_ScheduleRow> {
                   _infoTile(
                     Icons.arrow_upward,
                     'From Hostel',
-                    widget.bus.schedule?.fromHostelTime ?? 'Not set',
+                    (widget.schedule ?? widget.bus.schedule)?.fromHostelTime ??
+                        'Not set',
                     const Color(0xFF1565C0),
                   ),
                   const SizedBox(width: 8),
                   _infoTile(
                     Icons.arrow_downward,
                     'From MBSE',
-                    widget.bus.schedule?.fromMBSETime ?? 'Not set',
+                    (widget.schedule ?? widget.bus.schedule)?.fromMBSETime ??
+                        'Not set',
                     const Color(0xFF4CAF50),
                   ),
                 ],
               ),
-              if (widget.bus.schedule?.specialNote.isNotEmpty == true) ...[
+              if ((widget.schedule ?? widget.bus.schedule)
+                      ?.specialNote
+                      .isNotEmpty ==
+                  true) ...[
                 const SizedBox(height: 8),
                 Container(
                   padding: const EdgeInsets.all(8),
@@ -341,7 +338,7 @@ class _ScheduleRowState extends State<_ScheduleRow> {
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: Text(
-                    '📍 ${widget.bus.schedule!.specialNote}',
+                    '📍 ${(widget.schedule ?? widget.bus.schedule)!.specialNote}',
                     style: const TextStyle(fontSize: 12, color: Colors.orange),
                   ),
                 ),
@@ -445,30 +442,74 @@ class _ScheduleRowState extends State<_ScheduleRow> {
   Future<void> _saveSchedule(BuildContext context) async {
     final auth = context.read<AuthService>();
     final api = context.read<ApiService>();
+    final busService = context.read<BusService>();
+    final messenger = ScaffoldMessenger.of(context);
+    final today = DateTime.now();
+    final editingToday =
+        widget.date.year == today.year &&
+        widget.date.month == today.month &&
+        widget.date.day == today.day &&
+        (widget.schedule ?? widget.bus.schedule) != null;
+    if (editingToday) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Confirm today’s schedule edit'),
+          content: const Text(
+            'This bus is already scheduled for today. Are you sure you want to edit it?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Edit schedule'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+    }
     final dateStr = widget.date.toIso8601String().split('T')[0];
     final schedule = ScheduleModel(
-      id: widget.bus.schedule?.id ?? '',
+      id: (widget.schedule ?? widget.bus.schedule)?.id ?? '',
       busNumber: widget.bus.busNumber,
       date: dateStr,
       fromHostelTime: _fromHostelCtrl.text,
       fromMBSETime: _fromMBSECtrl.text,
-      specialNote: widget.bus.schedule?.specialNote ?? '',
+      specialNote: (widget.schedule ?? widget.bus.schedule)?.specialNote ?? '',
       updatedBy: auth.currentUser?.email ?? '',
     );
-    await context.read<BusService>().updateSchedule(
+    await busService.updateSchedule(
       schedule,
       api,
       auth.currentUser?.token ?? '',
     );
+    if (!mounted) return;
     setState(() => _isEditing = false);
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Saved!'),
-          duration: Duration(seconds: 1),
-          backgroundColor: Colors.green,
-        ),
-      );
+    messenger.showSnackBar(
+      const SnackBar(
+        content: Text('Saved!'),
+        duration: Duration(seconds: 1),
+        backgroundColor: Colors.green,
+      ),
+    );
+  }
+}
+
+ScheduleModel? _scheduleFor(
+  List<ScheduleModel> schedules,
+  int busNumber,
+  DateTime date,
+) {
+  final key =
+      '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+  for (final schedule in schedules) {
+    if (schedule.busNumber == busNumber && schedule.date.startsWith(key)) {
+      return schedule;
     }
   }
+  return null;
 }

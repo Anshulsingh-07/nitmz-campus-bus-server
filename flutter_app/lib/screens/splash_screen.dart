@@ -7,6 +7,7 @@ import 'auth/login_screen.dart';
 import 'student/student_home.dart';
 import 'admin/admin_home.dart';
 import 'driver/driver_home.dart';
+import 'auth/password_change_screen.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -55,7 +56,13 @@ class _SplashScreenState extends State<SplashScreen>
 
     if (!mounted) return;
     if (auth.isLoggedIn) {
-      _navigate(auth.isDriver ? const DriverHomeScreen() : (auth.isAdmin ? const AdminHome() : const StudentHome()));
+      _navigate(
+        auth.currentUser?.mustChangePassword == true
+            ? const PasswordChangeScreen()
+            : auth.isDriver
+            ? const DriverHomeScreen()
+            : (auth.isAdmin ? const AdminHome() : const StudentHome()),
+      );
     } else {
       _navigate(const LoginScreen());
     }

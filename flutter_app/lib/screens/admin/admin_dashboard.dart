@@ -6,7 +6,6 @@ import '../../services/notification_service.dart';
 import '../../services/api_service.dart';
 import '../../models/models.dart';
 import '../auth/login_screen.dart';
-import 'pending_drivers_screen.dart';
 
 class AdminDashboard extends StatelessWidget {
   const AdminDashboard({super.key});
@@ -89,13 +88,14 @@ class AdminDashboard extends StatelessWidget {
                               ),
                               onPressed: () async {
                                 await context.read<AuthService>().logout();
-                                if (context.mounted)
+                                if (context.mounted) {
                                   Navigator.pushReplacement(
                                     context,
                                     MaterialPageRoute(
                                       builder: (_) => const LoginScreen(),
                                     ),
                                   );
+                                }
                               },
                             ),
                           ],
@@ -201,10 +201,6 @@ class AdminDashboard extends StatelessWidget {
                       ),
                     ],
                   ),
-                  if (auth.currentUser?.role == 'admin') ...[
-                    Card(child: ListTile(leading: const Icon(Icons.badge_outlined), title: const Text('Pending Drivers'), subtitle: const Text('Review driver account requests'), trailing: const Icon(Icons.chevron_right), onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const PendingDriversScreen())))),
-                    const SizedBox(height: 12),
-                  ],
                   const SizedBox(height: 20),
 
                   // Quick Actions

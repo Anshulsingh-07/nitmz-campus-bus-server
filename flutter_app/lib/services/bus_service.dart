@@ -9,14 +9,17 @@ class BusService extends ChangeNotifier {
   List<BusModel> _buses = [];
   List<ScheduleModel> _schedules = [];
   bool _isLoading = false;
+  bool _isWaking = false;
   String? _error;
 
   List<BusModel> get buses => _buses;
   List<ScheduleModel> get schedules => _schedules;
   bool get isLoading => _isLoading;
+  bool get isWaking => _isWaking;
   String? get error => _error;
 
   Timer? _monitorTimer;
+  Timer? _wakingTimer;
   final Set<String> _sentNotifications = {};
 
   List<BusModel> getBusesByHostel(String hostel) =>
@@ -40,9 +43,18 @@ class BusService extends ChangeNotifier {
     String? hostel,
     String? token,
   }) async {
+    if (_isLoading) return;
     _isLoading = true;
+    _isWaking = false;
     _error = null;
     notifyListeners();
+    _wakingTimer?.cancel();
+    _wakingTimer = Timer(const Duration(seconds: 8), () {
+      if (_isLoading) {
+        _isWaking = true;
+        notifyListeners();
+      }
+    });
 
     try {
       final data = await api.getBuses(hostel: hostel, token: token);
@@ -51,10 +63,20 @@ class BusService extends ChangeNotifier {
           .toList();
     } catch (e) {
       _error = e.toString();
+    } finally {
+      _wakingTimer?.cancel();
+      _wakingTimer = null;
+      _isWaking = false;
+      _isLoading = false;
+      notifyListeners();
     }
+  }
 
-    _isLoading = false;
-    notifyListeners();
+  @override
+  void dispose() {
+    _wakingTimer?.cancel();
+    _monitorTimer?.cancel();
+    super.dispose();
   }
 
   Future<void> loadSchedules(
@@ -125,6 +147,10 @@ class BusService extends ChangeNotifier {
           driver: bus.driver,
           schedule: bus.schedule,
           route: (updatedBus['route'] ?? bus.route).toString(),
+          lastUpdated: updatedBus['lastUpdated'] == null
+              ? bus.lastUpdated
+              : DateTime.tryParse(updatedBus['lastUpdated'].toString()) ??
+                    bus.lastUpdated,
         );
         notifyListeners();
       }

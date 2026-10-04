@@ -13,19 +13,58 @@ class AuthService extends ChangeNotifier {
   String? get error => _error;
   bool get isLoggedIn => _currentUser != null;
   bool get isAdmin => _currentUser?.isAdmin ?? false;
-  bool get isDriver => _currentUser?.role == 'driver';
+  bool get isDriver => _currentUser?.isDriver ?? false;
 
   Future<void> checkAuthState(ApiService api) async {
     final prefs = await SharedPreferences.getInstance();
     final token = prefs.getString('token');
     final email = prefs.getString('email');
-    final phone = prefs.getString('phone');
+    if (token != null && email == null && prefs.getString('role') == 'driver') {
+      try {
+        final remoteUser = await api.getDriverCurrentUser(token);
+        _currentUser = UserModel.fromJson({...remoteUser, 'token': token});
+        await prefs.setString('name', _currentUser!.name);
+        await prefs.setString('phone', _currentUser!.phone ?? '');
+        if (_currentUser!.busNumber != null) {
+          await prefs.setInt('busNumber', _currentUser!.busNumber!);
+        }
+      } catch (_) {
+        _currentUser = null;
+        for (final key in [
+          'token',
+          'phone',
+          'busNumber',
+          'name',
+          'role',
+          'userId',
+        ]) {
+          await prefs.remove(key);
+        }
+      }
+      notifyListeners();
+      return;
+    }
+    if (token != null && email == null) {
+      for (final key in [
+        'token',
+        'phone',
+        'busNumber',
+        'name',
+        'role',
+        'userId',
+        'hostelId',
+      ]) {
+        await prefs.remove(key);
+      }
+      notifyListeners();
+      return;
+    }
     final name = prefs.getString('name');
     final role = prefs.getString('role');
     final hostelId = prefs.getString('hostelId');
     final userId = prefs.getString('userId');
 
-    if (token != null && (email != null || phone != null)) {
+    if (token != null && email != null) {
       try {
         final remoteUser = await api.getCurrentUser(token);
         _currentUser = UserModel(
@@ -34,13 +73,13 @@ class AuthService extends ChangeNotifier {
           email: (remoteUser['email'] ?? email ?? '').toString(),
           role: (remoteUser['role'] ?? role ?? 'student').toString(),
           hostelId: remoteUser['hostelId']?.toString() ?? hostelId,
-          phone: remoteUser['phone']?.toString() ?? phone,
-          busNumber: (remoteUser['busNumber'] as num?)?.toInt() ?? prefs.getInt('busNumber'),
+          mustChangePassword: remoteUser['mustChangePassword'] == true,
           token: token,
         );
 
-        if (_currentUser!.email.isNotEmpty) await prefs.setString('email', _currentUser!.email);
-        if (_currentUser!.phone != null) await prefs.setString('phone', _currentUser!.phone!);
+        if (_currentUser!.email.isNotEmpty) {
+          await prefs.setString('email', _currentUser!.email);
+        }
         await prefs.setString('name', _currentUser!.name);
         await prefs.setString('role', _currentUser!.role);
         await prefs.setString('userId', _currentUser!.id);
@@ -50,7 +89,18 @@ class AuthService extends ChangeNotifier {
         }
       } catch (_) {
         _currentUser = null;
-        for (final key in ['token','email','phone','name','role','userId','hostelId','busNumber']) { await prefs.remove(key); }
+        for (final key in [
+          'token',
+          'email',
+          'phone',
+          'name',
+          'role',
+          'userId',
+          'hostelId',
+          'busNumber',
+        ]) {
+          await prefs.remove(key);
+        }
       }
 
       notifyListeners();
@@ -75,6 +125,8 @@ class AuthService extends ChangeNotifier {
       await prefs.setString('name', _currentUser!.name);
       await prefs.setString('role', _currentUser!.role);
       await prefs.setString('userId', _currentUser!.id);
+      await prefs.remove('phone');
+      await prefs.remove('busNumber');
       if (_currentUser!.hostelId != null) {
         await prefs.setString('hostelId', _currentUser!.hostelId!);
       }
@@ -91,38 +143,33 @@ class AuthService extends ChangeNotifier {
   }
 
   Future<bool> driverLogin(String phone, String pin, ApiService api) async {
-    _isLoading = true; _error = null; notifyListeners();
+    _isLoading = true;
+    _error = null;
+    notifyListeners();
     try {
       final data = await api.driverLogin(phone, pin);
-      final user = Map<String, dynamic>.from(data['user'] as Map)..['token'] = data['token'];
-      _currentUser = UserModel.fromJson(user)..token = data['token'] as String;
+      final userJson = Map<String, dynamic>.from(data['user'] as Map);
+      userJson['token'] = data['token'];
+      _currentUser = UserModel.fromJson(userJson);
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('token', _currentUser!.token!);
+      await prefs.setString('token', data['token'].toString());
       await prefs.remove('email');
       await prefs.remove('hostelId');
-      await prefs.setString('userId', _currentUser!.id);
-      await prefs.setString('role', 'driver');
       await prefs.setString('name', _currentUser!.name);
-      await prefs.setString('phone', phone);
-      await prefs.setInt('busNumber', _currentUser!.busNumber!);
-      _isLoading = false; notifyListeners(); return true;
+      await prefs.setString('role', 'driver');
+      await prefs.setString('phone', _currentUser!.phone ?? phone);
+      await prefs.setString('userId', _currentUser!.id);
+      if (_currentUser!.busNumber != null) {
+        await prefs.setInt('busNumber', _currentUser!.busNumber!);
+      }
+      _isLoading = false;
+      notifyListeners();
+      return true;
     } catch (e) {
-      final message = e.toString().replaceFirst('Exception: ', '');
-      _error = message.contains('pending_approval')
-          ? 'Your account is awaiting caretaker approval.'
-          : message.contains('rejected')
-          ? 'Your registration was rejected. Contact the caretaker for details.'
-          : message;
-      _isLoading = false; notifyListeners(); return false;
-    }
-  }
-
-  Future<String?> driverRegister(String name, String phone, String pin, int busNumber, ApiService api) async {
-    _isLoading = true; _error = null; notifyListeners();
-    try { final result = await api.driverRegister(name, phone, pin, busNumber); _isLoading = false; notifyListeners(); return result['status']?.toString(); }
-    catch (e) {
       _error = e.toString().replaceFirst('Exception: ', '');
-      _isLoading = false; notifyListeners(); return null;
+      _isLoading = false;
+      notifyListeners();
+      return false;
     }
   }
 
@@ -149,6 +196,8 @@ class AuthService extends ChangeNotifier {
       await prefs.setString('name', _currentUser!.name);
       await prefs.setString('role', _currentUser!.role);
       await prefs.setString('userId', _currentUser!.id);
+      await prefs.remove('phone');
+      await prefs.remove('busNumber');
       if (_currentUser!.hostelId != null) {
         await prefs.setString('hostelId', _currentUser!.hostelId!);
       }
@@ -164,13 +213,59 @@ class AuthService extends ChangeNotifier {
     }
   }
 
-  void setError(String message) { _error = message; notifyListeners(); }
-  void clearError() { _error = null; notifyListeners(); }
+  Future<bool> changePassword(String newPassword, ApiService api) async {
+    _isLoading = true;
+    _error = null;
+    notifyListeners();
+    try {
+      final token = _currentUser?.token;
+      if (token == null || token.isEmpty) {
+        throw Exception('Sign in again to change your password');
+      }
+      await api.changePassword(token, newPassword);
+      _currentUser!.mustChangePassword = false;
+      _isLoading = false;
+      notifyListeners();
+      return true;
+    } catch (e) {
+      _error = e.toString().replaceFirst('Exception: ', '');
+      _isLoading = false;
+      notifyListeners();
+      return false;
+    }
+  }
+
+  void setError(String message) {
+    _error = message;
+    notifyListeners();
+  }
+
+  void clearError() {
+    _error = null;
+    notifyListeners();
+  }
 
   Future<void> logout() async {
+    final token = _currentUser?.token;
     _currentUser = null;
+    if (token != null) {
+      try {
+        await ApiService().logout(token);
+      } catch (_) {}
+    }
     final prefs = await SharedPreferences.getInstance();
-    for (final key in ['token','email','phone','name','role','userId','hostelId','busNumber']) { await prefs.remove(key); }
+    for (final key in [
+      'token',
+      'email',
+      'phone',
+      'name',
+      'role',
+      'userId',
+      'hostelId',
+      'busNumber',
+    ]) {
+      await prefs.remove(key);
+    }
     notifyListeners();
   }
 }

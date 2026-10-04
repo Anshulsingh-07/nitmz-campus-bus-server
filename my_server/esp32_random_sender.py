@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import json
 import random
 import time
@@ -31,7 +32,7 @@ def main():
     parser.add_argument("--interval", type=float, default=2.0, help="Seconds between sends")
     parser.add_argument("--bus-id", default="Bus 5", help="bus_id value")
     parser.add_argument("--device-id", default="ESP32-Device-1", help="device_id value")
-    parser.add_argument("--api-key", default="BUSTRACKESP1SECRETKEY", help="x-api-key header")
+    parser.add_argument("--api-key", default=os.environ.get("API_SECRET_KEY"), help="x-api-key header")
     parser.add_argument("--lat", type=float, default=23.7271, help="Start latitude")
     parser.add_argument("--lng", type=float, default=92.7176, help="Start longitude")
     parser.add_argument("--step", type=float, default=0.00035, help="Random movement step size")
@@ -40,6 +41,8 @@ def main():
     parser.add_argument("--count", type=int, default=0, help="Number of packets (0 = infinite)")
     parser.add_argument("--timeout", type=float, default=6.0, help="HTTP timeout seconds")
     args = parser.parse_args()
+    if not args.api_key:
+        parser.error("Set --api-key or API_SECRET_KEY")
 
     lat = args.lat
     lng = args.lng

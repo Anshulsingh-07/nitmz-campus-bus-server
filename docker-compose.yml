@@ -1,17 +1,15 @@
-version: '3.8'
-
 services:
   db:
-    image: mysql:8.0
+    image: postgres:16
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: "Ansh@2007"
-      MYSQL_DATABASE: "campus_bus_tracker"
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD with --env-file my_server/.env}
+      POSTGRES_DB: ${DB_NAME:-campus_bus_tracker}
     volumes:
-      - db_data:/var/lib/mysql
-    # Note: do not publish MySQL port to host to avoid conflicts; server uses internal Docker network
+      - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-campus_bus_tracker}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -23,17 +21,14 @@ services:
     env_file:
       - ./my_server/.env
     environment:
+      DB_PORT: "5432"
       DB_HOST: "db"
-      DB_PORT: "3306"
-      DB_USER: "root"
-      DB_PASSWORD: "Ansh@2007"
-      DB_NAME: "campus_bus_tracker"
     ports:
       - "8081:8080"
     depends_on:
       db:
         condition: service_healthy
-    command: sh -c "until nc -z db 3306; do echo waiting for db; sleep 1; done; node server.js"
+    command: node server.js
 
 volumes:
   db_data:

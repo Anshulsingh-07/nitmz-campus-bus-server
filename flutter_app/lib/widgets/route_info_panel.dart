@@ -35,29 +35,49 @@ class RouteInfoPanel extends StatelessWidget {
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text('${(options.first.durationSeconds/60).round()} min', style: const TextStyle(fontWeight: FontWeight.bold)),
-                  Text('${(options.first.distanceMeters/1000).toStringAsFixed(2)} km', style: const TextStyle(color: Colors.black54)),
+                  Text(
+                    '${(options.first.durationSeconds / 60).round()} min',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  Text(
+                    '${(options.first.distanceMeters / 1000).toStringAsFixed(2)} km',
+                    style: const TextStyle(color: Colors.black54),
+                  ),
                 ],
               ),
             ),
           for (var idx = 0; idx < options.length; idx++)
-            Builder(builder: (context) {
-              final opt = options[idx];
-              final mins = (opt.durationSeconds / 60).round();
-              final km = (opt.distanceMeters / 1000).toStringAsFixed(1);
-              return Card(
-                elevation: 0,
-                margin: const EdgeInsets.symmetric(vertical: 6.0),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                child: ListTile(
-                  onTap: () => onSelectRoute?.call(idx),
-                  leading: Icon(idx == 0 ? Icons.directions_car : Icons.alt_route, color: idx == 0 ? Colors.blue : Colors.grey),
-                  title: Text('${mins} min', style: const TextStyle(fontWeight: FontWeight.bold)),
-                  subtitle: Text('${km} km • ${opt.summary.isNotEmpty ? opt.summary : opt.provider}'),
-                  trailing: idx == 0 ? const Icon(Icons.check, color: Colors.green) : null,
-                ),
-              );
-            }),
+            Builder(
+              builder: (context) {
+                final opt = options[idx];
+                final mins = (opt.durationSeconds / 60).round();
+                final km = (opt.distanceMeters / 1000).toStringAsFixed(1);
+                return Card(
+                  elevation: 0,
+                  margin: const EdgeInsets.symmetric(vertical: 6.0),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: ListTile(
+                    onTap: () => onSelectRoute?.call(idx),
+                    leading: Icon(
+                      idx == 0 ? Icons.directions_car : Icons.alt_route,
+                      color: idx == 0 ? Colors.blue : Colors.grey,
+                    ),
+                    title: Text(
+                      '$mins min',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    subtitle: Text(
+                      '$km km • ${opt.summary.isNotEmpty ? opt.summary : opt.provider}',
+                    ),
+                    trailing: idx == 0
+                        ? const Icon(Icons.check, color: Colors.green)
+                        : null,
+                  ),
+                );
+              },
+            ),
         ],
       ),
     );

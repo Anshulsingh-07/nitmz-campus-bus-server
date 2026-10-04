@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
- 
+
 import 'package:flutter/foundation.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
@@ -22,7 +22,9 @@ class RoutingService {
     final key = _cacheKey(origin, destination, mode);
     // Return cached result if fresh
     final cached = _cache[key];
-    if (cached != null && DateTime.now().difference(cached.timestamp).inSeconds < _cacheTtlSeconds) {
+    if (cached != null &&
+        DateTime.now().difference(cached.timestamp).inSeconds <
+            _cacheTtlSeconds) {
       return cached.model;
     }
 
@@ -38,9 +40,23 @@ class RoutingService {
     RouteModel? result;
     try {
       if (googleKey.isNotEmpty) {
-        result = await _getGoogleRoute(origin, destination, mode, googleKey, timeout);
-      } else if (mapboxToken.isNotEmpty) {
-        result = await _getMapboxRoute(origin, destination, mode, mapboxToken, timeout);
+        result = await _getGoogleRoute(
+          origin,
+          destination,
+          mode,
+          googleKey,
+          timeout,
+        );
+      }
+      if ((result == null || result.primary == null) &&
+          mapboxToken.isNotEmpty) {
+        result = await _getMapboxRoute(
+          origin,
+          destination,
+          mode,
+          mapboxToken,
+          timeout,
+        );
       }
     } catch (e) {
       if (kDebugMode) debugPrint('RoutingService.getRoute error: $e');
@@ -48,16 +64,16 @@ class RoutingService {
     }
 
     // cache and complete
-      if (result != null) {
-        // insert into cache and maintain simple LRU order
-        _cache[key] = _CachedRoute(model: result, timestamp: DateTime.now());
-        _cacheOrder.remove(key);
-        _cacheOrder.add(key);
-        if (_cacheOrder.length > _cacheMaxEntries) {
-          final oldest = _cacheOrder.removeAt(0);
-          _cache.remove(oldest);
-        }
+    if (result != null) {
+      // insert into cache and maintain simple LRU order
+      _cache[key] = _CachedRoute(model: result, timestamp: DateTime.now());
+      _cacheOrder.remove(key);
+      _cacheOrder.add(key);
+      if (_cacheOrder.length > _cacheMaxEntries) {
+        final oldest = _cacheOrder.removeAt(0);
+        _cache.remove(oldest);
       }
+    }
     completer.complete(result);
     _inflight.remove(key);
     return result;
@@ -116,20 +132,28 @@ class RoutingService {
         int duration = 0;
         int distance = 0;
         if (legs.isNotEmpty) {
-          duration = legs.fold(0, (p, e) => p + (e['duration']?['value'] as int? ?? 0));
-          distance = legs.fold(0, (p, e) => p + (e['distance']?['value'] as int? ?? 0));
+          duration = legs.fold(
+            0,
+            (p, e) => p + (e['duration']?['value'] as int? ?? 0),
+          );
+          distance = legs.fold(
+            0,
+            (p, e) => p + (e['distance']?['value'] as int? ?? 0),
+          );
         }
         final overview = r['overview_polyline'] as Map<String, dynamic>?;
         final points = overview != null && overview['points'] is String
             ? _decodePolyline(overview['points'] as String)
             : <LatLng>[];
-        options.add(RouteOption(
-          provider: 'google',
-          summary: r['summary']?.toString() ?? '',
-          geometry: points,
-          durationSeconds: duration,
-          distanceMeters: distance,
-        ));
+        options.add(
+          RouteOption(
+            provider: 'google',
+            summary: r['summary']?.toString() ?? '',
+            geometry: points,
+            durationSeconds: duration,
+            distanceMeters: distance,
+          ),
+        );
       }
 
       return RouteModel(options: options);
@@ -153,7 +177,8 @@ class RoutingService {
       TravelMode.transit => 'driving',
       _ => 'driving',
     };
-    final coords = '${origin.longitude},${origin.latitude};${destination.longitude},${destination.latitude}';
+    final coords =
+        '${origin.longitude},${origin.latitude};${destination.longitude},${destination.latitude}';
     final uri = Uri.parse(
       'https://api.mapbox.com/directions/v5/mapbox/$profile/$coords'
       '?geometries=polyline&overview=full&alternatives=true&access_token=$token',
@@ -172,14 +197,18 @@ class RoutingService {
         final duration = (r['duration'] as num?)?.toInt() ?? 0;
         final distance = (r['distance'] as num?)?.toInt() ?? 0;
         final geometry = r['geometry'] as String? ?? '';
-        final points = geometry.isNotEmpty ? _decodePolyline(geometry) : <LatLng>[];
-        options.add(RouteOption(
-          provider: 'mapbox',
-          summary: '',
-          geometry: points,
-          durationSeconds: duration,
-          distanceMeters: distance,
-        ));
+        final points = geometry.isNotEmpty
+            ? _decodePolyline(geometry)
+            : <LatLng>[];
+        options.add(
+          RouteOption(
+            provider: 'mapbox',
+            summary: '',
+            geometry: points,
+            durationSeconds: duration,
+            distanceMeters: distance,
+          ),
+        );
       }
 
       return RouteModel(options: options);

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../../services/auth_service.dart';
 import '../../services/bus_service.dart';
@@ -274,7 +275,7 @@ class _AdminBusCard extends StatelessWidget {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        bus.driver?.name ?? 'Unknown',
+                        bus.driver?.name ?? 'No driver assigned',
                         style: const TextStyle(fontWeight: FontWeight.w500),
                       ),
                     ),
@@ -525,6 +526,7 @@ class _EditDriverSheet extends StatefulWidget {
 class _EditDriverSheetState extends State<_EditDriverSheet> {
   late TextEditingController _driverNameCtrl;
   late TextEditingController _driverPhoneCtrl;
+  final _pinCtrl = TextEditingController();
   bool _saving = false;
 
   @override
@@ -542,6 +544,7 @@ class _EditDriverSheetState extends State<_EditDriverSheet> {
   void dispose() {
     _driverNameCtrl.dispose();
     _driverPhoneCtrl.dispose();
+    _pinCtrl.dispose();
     super.dispose();
   }
 
@@ -595,8 +598,26 @@ class _EditDriverSheetState extends State<_EditDriverSheet> {
           TextField(
             controller: _driverPhoneCtrl,
             keyboardType: TextInputType.phone,
+            maxLength: 10,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
             decoration: InputDecoration(
               labelText: 'Mobile Number',
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _pinCtrl,
+            keyboardType: TextInputType.number,
+            maxLength: 6,
+            obscureText: true,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            decoration: InputDecoration(
+              labelText: 'Set / reset driver PIN',
+              hintText: 'Leave blank to keep the current PIN',
+              helperText: '6 digits. PIN is write-only and never displayed.',
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(10),
               ),
@@ -629,10 +650,15 @@ class _EditDriverSheetState extends State<_EditDriverSheet> {
   Future<void> _saveDriver(BuildContext context) async {
     final name = _driverNameCtrl.text.trim();
     final phone = _driverPhoneCtrl.text.trim();
-    if (name.isEmpty || phone.isEmpty) {
+    final pin = _pinCtrl.text.trim();
+    if (name.isEmpty ||
+        phone.isEmpty ||
+        (pin.isNotEmpty && !RegExp(r'^\d{6}$').hasMatch(pin))) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Please enter driver name and mobile number'),
+          content: Text(
+            'Enter driver name, mobile number, and a valid 6-digit PIN if setting one',
+          ),
         ),
       );
       return;
@@ -648,6 +674,7 @@ class _EditDriverSheetState extends State<_EditDriverSheet> {
         busNumber: widget.bus.busNumber,
         driverName: name,
         driverPhone: phone,
+        pin: pin.isEmpty ? null : pin,
         token: token,
       );
       if (!context.mounted) return;
@@ -682,6 +709,7 @@ class _AddBusSheetState extends State<_AddBusSheet> {
   final _busNumberCtrl = TextEditingController();
   final _driverNameCtrl = TextEditingController();
   final _driverPhoneCtrl = TextEditingController();
+  final _pinCtrl = TextEditingController();
   String _hostelId = 'BH1';
   bool _saving = false;
 
@@ -700,6 +728,7 @@ class _AddBusSheetState extends State<_AddBusSheet> {
     _busNumberCtrl.dispose();
     _driverNameCtrl.dispose();
     _driverPhoneCtrl.dispose();
+    _pinCtrl.dispose();
     super.dispose();
   }
 
@@ -763,11 +792,24 @@ class _AddBusSheetState extends State<_AddBusSheet> {
           TextField(
             controller: _driverPhoneCtrl,
             keyboardType: TextInputType.phone,
+            maxLength: 10,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
             decoration: InputDecoration(
               labelText: 'Mobile Number',
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(10),
               ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _pinCtrl,
+            keyboardType: TextInputType.number,
+            maxLength: 6,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            decoration: InputDecoration(
+              labelText: 'Driver login PIN (6 digits)',
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
             ),
           ),
           const SizedBox(height: 12),
@@ -821,11 +863,12 @@ class _AddBusSheetState extends State<_AddBusSheet> {
     final busNumber = int.tryParse(_busNumberCtrl.text.trim());
     final driverName = _driverNameCtrl.text.trim();
     final driverPhone = _driverPhoneCtrl.text.trim();
-    if (busNumber == null || driverName.isEmpty || driverPhone.isEmpty) {
+    final pin = _pinCtrl.text.trim();
+    if (busNumber == null || driverName.isEmpty || driverPhone.isEmpty || !RegExp(r'^\d{6}$').hasMatch(pin)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-            'Enter valid bus number, driver name, and mobile number',
+            'Enter bus, driver details, and a 6-digit login PIN',
           ),
         ),
       );
@@ -843,6 +886,7 @@ class _AddBusSheetState extends State<_AddBusSheet> {
         assignedHostel: _hostelId,
         driverName: driverName,
         driverPhone: driverPhone,
+        pin: pin,
         token: token,
       );
 

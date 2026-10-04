@@ -8,14 +8,21 @@ require('dotenv').config();
 if (process.env.NODE_ENV === 'production' && !process.env.API_SECRET_KEY) {
     throw new Error('API_SECRET_KEY must be configured in production');
 }
+if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL) {
+    const missingDatabaseSettings = ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME']
+        .filter((key) => !process.env[key]);
+    if (missingDatabaseSettings.length) {
+        throw new Error(`Database environment is incomplete: ${missingDatabaseSettings.join(', ')}`);
+    }
+}
 
 const app = express();
 const telemetryEmitter = new EventEmitter();
 telemetryEmitter.setMaxListeners(0);
 const port = Number(process.env.PORT || 8080);
-const API_SECRET_KEY = process.env.API_SECRET_KEY || 'BUSTRACKESP1SECRETKEY';
+const API_SECRET_KEY = process.env.API_SECRET_KEY || null;
 
-const DB_HOST = process.env.DB_HOST || '127.0.0.1';
+const DB_HOST = process.env.DB_HOST || '127.0.0.1'; // Local development default only; Render sets DB_HOST.
 const DB_PORT = Number(process.env.DB_PORT || 5432);
 const DB_USER = process.env.DB_USER || 'root';
 const DB_PASSWORD = process.env.DB_PASSWORD || '';
@@ -66,6 +73,7 @@ const notificationsSeed = [
 
 const sessions = new Map();
 const driverLoginFailures = new Map();
+const passwordResetAttempts = new Map();
 const driverLastFixes = new Map();
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -95,6 +103,7 @@ function publicUser(row) {
         email: row.email,
         role: row.role,
         hostelId: row.hostel_id,
+        mustChangePassword: Boolean(row.must_change_password),
     };
 }
 
@@ -202,6 +211,14 @@ function requireAuth(req, res, allowedRoles = null) {
         res.status(403).json({ error: 'Forbidden' });
         return null;
     }
+    if (session.mustChangePassword && ![
+        '/api/me',
+        '/api/auth/change-password',
+        '/api/auth/logout',
+    ].includes(req.path)) {
+        res.status(403).json({ error: 'Change your temporary password to continue' });
+        return null;
+    }
 
     return { token, ...session };
 }
@@ -216,6 +233,7 @@ function createToken(user) {
         hostelId: user.hostel_id,
         phone: user.phone,
         busNumber: user.bus_number,
+        mustChangePassword: Boolean(user.must_change_password),
         expiresAt,
     });
     return token;
@@ -270,7 +288,7 @@ async function assertCaretakerAccess(busNumber, auth) {
     if (!busRows.length) {
         return { ok: false, code: 404, message: 'Bus not found' };
     }
-    if (auth.role === 'caretaker' && auth.hostelId && busRows[0].assigned_hostel !== auth.hostelId) {
+    if (auth.role === 'caretaker' && (!auth.hostelId || busRows[0].assigned_hostel !== auth.hostelId)) {
         return { ok: false, code: 403, message: 'Caretaker can only update own hostel buses' };
     }
     return { ok: true, bus: busRows[0] };
@@ -319,6 +337,12 @@ CREATE TABLE IF NOT EXISTS users (
   FOREIGN KEY (hostel_id) REFERENCES hostels(id) ON DELETE SET NULL
 );
 `);
+    await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false');
+    const duplicateEmails = await q('SELECT LOWER(email) AS email FROM users GROUP BY LOWER(email) HAVING COUNT(*) > 1');
+    if (duplicateEmails.length) {
+        throw new Error('Duplicate email accounts must be resolved before the server can start');
+    }
+    await q('CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique ON users (LOWER(email))');
 
     await q(`
 CREATE TABLE IF NOT EXISTS buses (
@@ -397,21 +421,6 @@ CREATE TABLE IF NOT EXISTS telemetry (
         }
     }
 
-    // Remove legacy demo accounts created by earlier versions; their public
-    // credentials must never remain usable after upgrading the server.
-    for (const email of [
-        'student@nitmz.ac.in',
-        'admin@nitmz.ac.in',
-        'caretaker-gh1@nitmz.ac.in',
-        'caretaker-gh2@nitmz.ac.in',
-        'caretaker-bh1@nitmz.ac.in',
-        'caretaker-bh2@nitmz.ac.in',
-        'caretaker-bh3@nitmz.ac.in',
-        'caretaker-bh4@nitmz.ac.in',
-    ]) {
-        await q('DELETE FROM users WHERE LOWER(email) = LOWER(?)', [email]);
-    }
-
     const [busCountRow] = await q('SELECT COUNT(*) AS count FROM buses');
     const busCount = busCountRow ? Number(busCountRow.count) : 0;
     if (busCount === 0) {
@@ -487,20 +496,22 @@ app.post('/api/auth/register', async (req, res) => {
         if (!name || !email || !password) {
             return res.status(400).json({ error: 'name, email, and password are required' });
         }
-        if (!String(email).toLowerCase().endsWith('@nitmz.ac.in')) {
-            return res.status(400).json({ error: 'Only @nitmz.ac.in emails are allowed' });
+        const normalizedEmail = String(email).trim().toLowerCase();
+        if (!normalizedEmail.endsWith('@nitmz.ac.in')) {
+            return res.status(400).json({ error: 'Use your NIT Mizoram email address' });
         }
 
-        const existing = await q('SELECT id FROM users WHERE email = ?', [email]);
+        const existing = await q('SELECT id FROM users WHERE LOWER(email) = LOWER(?)', [normalizedEmail]);
         if (existing.length > 0) {
-            return res.status(409).json({ error: 'Email already registered' });
+            return res.status(409).json({ error: 'This email is already registered — log in instead' });
         }
 
+        const passwordHash = await bcrypt.hash(String(password), 12);
         const user = {
             id: uid('usr_'),
             name,
-            email,
-            password,
+            email: normalizedEmail,
+            password: passwordHash,
             // Public registration can only create student accounts. Caretakers
             // must be provisioned through a trusted administrative process.
             role: 'student',
@@ -515,6 +526,9 @@ app.post('/api/auth/register', async (req, res) => {
         const token = createToken(user);
         return res.json({ token, user: publicUser(user) });
     } catch (error) {
+        if (error.code === '23505' || error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'This email is already registered — log in instead' });
+        }
         return res.status(500).json({ error: error.message });
     }
 });
@@ -526,11 +540,16 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 app.get('/api/buses/live', async (req, res) => {
-    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin']);
+    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin', 'driver']);
     if (!auth) return;
 
     try {
-        const hostel = auth.role === 'student' ? auth.hostelId : (req.query.hostel || null);
+        if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
+        // Student browsing is intentionally cross-hostel for missed-bus fallback.
+        // Caretakers remain scoped to their assigned hostel.
+        const hostel = auth.role === 'caretaker'
+            ? auth.hostelId
+            : (req.query.hostel || null);
         const where = hostel ? 'WHERE b.assigned_hostel = ?' : '';
         const rows = await q(
             `
@@ -578,11 +597,12 @@ app.get('/api/buses/live', async (req, res) => {
 });
 
 app.get('/api/buses/stream', async (req, res) => {
-    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin']);
+    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin', 'driver']);
     if (!auth) return;
 
     try {
-        const hostel = auth.role === 'student' ? auth.hostelId : null;
+        if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
+        const hostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : null;
         const rows = await q(`
             SELECT b.bus_number, b.assigned_hostel, b.status, b.latitude, b.longitude, b.speed, b.route,
                    t.lat, t.lng, t.heading, t.has_fix, t.satellites, t.hdop, t.net_type, t.status AS telemetry_status, t.received_at
@@ -632,7 +652,7 @@ app.get('/api/buses/stream', async (req, res) => {
         res.write(`data: ${JSON.stringify(initialData)}\n\n`);
 
         const onUpdate = (data) => {
-            if (auth.role === 'student' && (!auth.hostelId || auth.hostelId.toUpperCase() !== String(data.assigned_hostel || '').toUpperCase())) return;
+            if (['student', 'caretaker'].includes(auth.role) && (!auth.hostelId || auth.hostelId.toUpperCase() !== String(data.assigned_hostel || '').toUpperCase())) return;
             const eventData = { ...data };
             if (auth.role === 'student') {
                 delete eventData.satellites;
@@ -751,17 +771,73 @@ app.get('/api/telemetry/history', async (req, res) => {
     }
 });
 
+app.post('/api/auth/forgot-password', async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email || email.length > 254) {
+        return res.status(400).json({ error: 'Enter a valid email address' });
+    }
+
+    const now = Date.now();
+    const windowMs = 60 * 60 * 1000;
+    const recentAttempts = (passwordResetAttempts.get(email) || []).filter((time) => now - time < windowMs);
+    if (recentAttempts.length >= 5) {
+        passwordResetAttempts.set(email, recentAttempts);
+        return res.status(429).json({ error: 'Too many reset attempts. Try again later.' });
+    }
+    recentAttempts.push(now);
+    passwordResetAttempts.set(email, recentAttempts);
+
+    try {
+        const rows = await q('SELECT id, email, role FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
+        if (rows.length) {
+            const localPart = rows[0].email.split('@')[0];
+            const defaultPassword = localPart.slice(0, rows[0].role === 'caretaker' ? 13 : 9);
+            const passwordHash = await bcrypt.hash(defaultPassword, 12);
+            await q('UPDATE users SET password = ?, must_change_password = true WHERE id = ?', [passwordHash, rows[0].id]);
+            for (const [token, session] of sessions) {
+                if (session.userId === rows[0].id) sessions.delete(token);
+            }
+        }
+        return res.json({ message: 'If this account exists, a default password has been set. Check your email format, then change it after signing in.' });
+    } catch (error) {
+        return res.status(500).json({ error: 'Password reset is temporarily unavailable' });
+    }
+});
+
+app.post('/api/auth/change-password', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    const newPassword = String(req.body?.newPassword || '');
+    if (newPassword.length < 8 || newPassword.length > 128) {
+        return res.status(400).json({ error: 'Choose a password between 8 and 128 characters' });
+    }
+    try {
+        const passwordHash = await bcrypt.hash(newPassword, 12);
+        await q('UPDATE users SET password = ?, must_change_password = false WHERE id = ?', [passwordHash, auth.userId]);
+        const session = sessions.get(auth.token);
+        if (session) session.mustChangePassword = false;
+        return res.json({ status: 'success', message: 'Password updated' });
+    } catch (error) {
+        return res.status(500).json({ error: 'Could not update password' });
+    }
+});
+
 app.post('/api/auth/login', async (req, res) => {
     try {
-        const { email, password } = req.body || {};
-        const rows = await q('SELECT id, name, email, role, hostel_id, password FROM users WHERE email = ? LIMIT 1', [email || '']);
-        if (rows.length === 0 || rows[0].password !== password) {
+        const email = String(req.body?.email || '').trim().toLowerCase();
+        const password = String(req.body?.password || '');
+        const rows = await q('SELECT id, name, email, role, hostel_id, password, must_change_password FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
+        const storedPassword = rows[0]?.password || '';
+        const isBcryptHash = /^\$2[aby]\$/.test(storedPassword);
+        const passwordMatches = rows.length > 0 && isBcryptHash
+            && await bcrypt.compare(password, storedPassword);
+        if (!passwordMatches) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
         const user = rows[0];
         const token = createToken(user);
-        return res.json({ token, user: publicUser(user) });
+        return res.json({ token, user: publicUser(user), mustChangePassword: Boolean(user.must_change_password) });
     } catch (error) {
         return res.status(500).json({ error: error.message });
     }
@@ -826,7 +902,7 @@ app.get('/api/me', async (req, res) => {
     if (!auth) return;
 
     try {
-        const rows = await q('SELECT id, name, email, role, hostel_id FROM users WHERE id = ? LIMIT 1', [auth.userId]);
+        const rows = await q('SELECT id, name, email, role, hostel_id, must_change_password FROM users WHERE id = ? LIMIT 1', [auth.userId]);
         if (rows.length === 0) return res.status(404).json({ error: 'User not found' });
         return res.json({ status: 'success', user: publicUser(rows[0]) });
     } catch (error) {
@@ -835,16 +911,17 @@ app.get('/api/me', async (req, res) => {
 });
 
 app.get('/api/buses', async (req, res) => {
-    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin']);
+    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin', 'driver']);
     if (!auth) return;
 
     try {
-        const hostel = req.query.hostel || null;
+        if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
+        const hostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : (req.query.hostel || null);
         if (auth.role === 'student' && auth.hostelId && hostel && hostel !== auth.hostelId) {
             return res.status(403).json({ error: 'Students can only view their own hostel buses' });
         }
 
-        const targetHostel = auth.role === 'student' ? auth.hostelId : hostel;
+        const targetHostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : hostel;
         const where = targetHostel ? 'WHERE b.assigned_hostel = ?' : '';
         const rows = await q(`${BUS_SELECT} ${where} ORDER BY b.bus_number`, targetHostel ? [targetHostel] : []);
         return res.json(rows.map(mapBus));
@@ -854,14 +931,49 @@ app.get('/api/buses', async (req, res) => {
 });
 
 app.get('/api/all-buses', async (req, res) => {
-    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin']);
+    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin', 'driver']);
     if (!auth) return;
 
     try {
-        const hostel = auth.role === 'student' ? auth.hostelId : (req.query.hostel || null);
+        if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
+        const hostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : (req.query.hostel || null);
         const where = hostel ? 'WHERE b.assigned_hostel = ?' : '';
         const rows = await q(`${BUS_SELECT} ${where} ORDER BY b.bus_number`, hostel ? [hostel] : []);
         return res.json({ status: 'success', data: rows.map(mapBus) });
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/today-buses', async (req, res) => {
+    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin', 'driver']);
+    if (!auth) return;
+    const date = String(req.query.date || today());
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        return res.status(400).json({ error: 'date must use YYYY-MM-DD format' });
+    }
+    try {
+        const values = [date];
+        let accessFilter = '';
+        if (auth.role === 'caretaker') {
+            if (!auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
+            values.push(auth.hostelId);
+            accessFilter = ` AND b.assigned_hostel = $${values.length}`;
+        }
+        const rows = await q(`${BUS_SELECT}
+            WHERE b.is_enabled = true
+              AND b.bus_number IN (SELECT bus_number FROM schedules WHERE date = $1)
+              ${accessFilter}
+            ORDER BY b.assigned_hostel, b.bus_number`, values);
+        const schedules = await q(`SELECT id AS schedule_id, bus_number, date AS schedule_date,
+                from_hostel_time, from_mbse_time, special_note, updated_by
+            FROM schedules WHERE date = $1`, [date]);
+        const scheduleByBus = new Map(schedules.map((schedule) => [Number(schedule.bus_number), schedule]));
+        const data = rows.map((row) => ({
+            ...row,
+            ...(scheduleByBus.get(Number(row.bus_number)) || {}),
+        }));
+        return res.json(data.map(mapBus));
     } catch (error) {
         return res.status(500).json({ error: error.message });
     }
@@ -877,6 +989,9 @@ app.get('/api/buses/:busNumber', async (req, res) => {
         if (auth.role === 'student' && auth.hostelId !== bus.assignedHostel) {
             return res.status(403).json({ error: 'Access denied' });
         }
+        if (auth.role === 'caretaker' && (!auth.hostelId || auth.hostelId !== bus.assignedHostel)) {
+            return res.status(403).json({ error: 'Caretaker can only view own hostel buses' });
+        }
         return res.json(bus);
     } catch (error) {
         return res.status(500).json({ error: error.message });
@@ -888,9 +1003,9 @@ app.post('/api/buses', async (req, res) => {
     if (!auth) return;
 
     try {
-        const { busNumber, assignedHostel, driverName, driverPhone, latitude, longitude, route } = req.body || {};
-        if (busNumber === undefined || !String(driverName || '').trim() || !String(driverPhone || '').trim()) {
-            return res.status(400).json({ error: 'busNumber, driverName, and driverPhone are required' });
+        const { busNumber, assignedHostel, driverName, driverPhone, pin, latitude, longitude, route } = req.body || {};
+        if (busNumber === undefined || !String(driverName || '').trim() || !String(driverPhone || '').trim() || !/^\d{6}$/.test(String(pin || ''))) {
+            return res.status(400).json({ error: 'busNumber, driverName, driverPhone, and a 6-digit PIN are required' });
         }
         const normalizedPhone = String(driverPhone).replace(/\D/g, '').slice(-10);
         if (!/^[6-9]\d{9}$/.test(normalizedPhone)) return res.status(400).json({ error: 'Enter a valid 10-digit Indian mobile number' });
@@ -923,8 +1038,8 @@ app.post('/api/buses', async (req, res) => {
             ]
         );
 
-            await client.query('INSERT INTO drivers (id,bus_number,name,phone,is_active) VALUES ($1,$2,$3,$4,true)', [
-                uid('drv_'), Number(busNumber), String(driverName).trim(), normalizedPhone,
+            await client.query('INSERT INTO drivers (id,bus_number,name,phone,pin_hash,is_active) VALUES ($1,$2,$3,$4,$5,true)', [
+                uid('drv_'), Number(busNumber), String(driverName).trim(), normalizedPhone, await bcrypt.hash(String(pin), 10),
             ]);
             await client.query('COMMIT');
         } catch (error) {
@@ -986,11 +1101,12 @@ app.patch('/api/buses/:busNumber/driver', async (req, res) => {
 });
 
 app.get('/api/schedules', async (req, res) => {
-    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin']);
+    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin', 'driver']);
     if (!auth) return;
 
     try {
-        const hostel = auth.role === 'student' ? auth.hostelId : (req.query.hostel || null);
+        if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
+        const hostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : (req.query.hostel || null);
         const date = req.query.date || null;
 
         const rows = await q(
@@ -1142,7 +1258,8 @@ app.get('/api/notifications', async (req, res) => {
     if (!auth) return;
 
     try {
-        const hostel = auth.role === 'student' ? auth.hostelId : (req.query.hostel || null);
+        if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
+        const hostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : (req.query.hostel || null);
         const rows = await q(
             `
             SELECT
@@ -1176,11 +1293,18 @@ app.post('/api/notifications/send', async (req, res) => {
             message,
             type = 'general',
             busNumber = null,
-            targetHostel = auth.hostelId || null,
+            targetHostel = auth.role === 'caretaker' ? auth.hostelId : (auth.hostelId || null),
         } = req.body || {};
 
         if (!title || !message) {
             return res.status(400).json({ error: 'title and message are required' });
+        }
+        if (auth.role === 'caretaker' && (!auth.hostelId || targetHostel !== auth.hostelId)) {
+            return res.status(403).json({ error: 'Caretakers can only post to their own hostel' });
+        }
+        if (auth.role === 'caretaker' && busNumber != null) {
+            const access = await assertCaretakerAccess(busNumber, auth);
+            if (!access.ok) return res.status(access.code).json({ error: access.message });
         }
 
         const id = uid('n_');
@@ -1297,6 +1421,9 @@ app.post('/api/location', async (req, res) => {
 });
 
 app.post('/api/update-location', async (req, res) => {
+    if (!API_SECRET_KEY) {
+        return res.status(503).json({ error: 'Telemetry ingestion is not configured' });
+    }
     const clientKey = req.header('x-api-key');
     if (clientKey !== API_SECRET_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });

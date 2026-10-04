@@ -1,568 +1,657 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+
 import '../../services/api_service.dart';
 import '../../services/auth_service.dart';
 import '../auth/login_screen.dart';
+import '../student/map_screen.dart';
 
 class DriverHomeScreen extends StatefulWidget {
   const DriverHomeScreen({super.key});
+
   @override
   State<DriverHomeScreen> createState() => _DriverHomeScreenState();
 }
 
 class _DriverHomeScreenState extends State<DriverHomeScreen> {
-  StreamSubscription<Position>? _subscription;
-  Timer? _uiTimer;
-  Position? _lastPosition;
-  DateTime? _lastSentAt;
-  Position? _lastSentPosition;
+  StreamSubscription<Position>? _positionSubscription;
+  Timer? _queueTimer;
+  Timer? _clockTimer;
+  final List<Map<String, dynamic>> _queue = [];
+  Position? _position;
+  Map<String, dynamic>? _lastFix;
+  DateTime? _lastQueuedAt;
+  DateTime? _lastSuccessfulSend;
   bool _sharing = false;
-  bool _connected = true;
+  bool _sending = false;
+  bool _busy = false;
+  bool _authExpired = false;
   String? _message;
-  int _queueSize = 0;
-  bool _flushingQueue = false;
-  DateTime? _retryAfter;
-  Duration _retryDelay = const Duration(seconds: 2);
-  static const _queueKey = 'driver_location_queue';
-  static const _tripKey = 'driver_trip_active';
+  String? _queueKey;
+
+  int get _busNumber => context.read<AuthService>().currentUser?.busNumber ?? 0;
+  String get _tripKey => 'driver_trip_active_$_busNumber';
 
   @override
   void initState() {
     super.initState();
-    _restoreTrip();
-    _uiTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
-      _retryQueuedLocations();
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _restoreTrip());
   }
 
   Future<void> _restoreTrip() async {
     final prefs = await SharedPreferences.getInstance();
+    _queueKey = 'driver_location_queue_$_busNumber';
+    final lastFix = prefs.getString('driver_last_fix_$_busNumber');
+    if (lastFix != null) {
+      try {
+        _lastFix = Map<String, dynamic>.from(jsonDecode(lastFix) as Map);
+      } catch (_) {
+        await prefs.remove('driver_last_fix_$_busNumber');
+      }
+    }
+    final encoded = prefs.getString(_queueKey!);
+    if (encoded != null) {
+      try {
+        final stored = jsonDecode(encoded);
+        if (stored is List) {
+          _queue.addAll(
+            stored.whereType<Map>().map(
+              (item) => Map<String, dynamic>.from(item),
+            ),
+          );
+        }
+      } catch (_) {
+        await prefs.remove(_queueKey!);
+      }
+    }
+    _queueTimer = Timer.periodic(
+      const Duration(seconds: 8),
+      (_) => _flushQueue(),
+    );
+    if (mounted) setState(() {});
     if (prefs.getBool(_tripKey) == true && mounted) {
       final resume = await showDialog<bool>(
         context: context,
-        builder: (c) => AlertDialog(
-          title: const Text('Resume location sharing?'),
+        builder: (context) => AlertDialog(
+          title: const Text('Resume your trip?'),
           content: const Text(
-            'Your previous trip was interrupted. Resume sharing this phone’s location for your assigned bus?',
+            'A trip was active when Campus Bus Tracker last closed. Resume sharing this bus location?',
           ),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(c, false),
+              onPressed: () => Navigator.pop(context, false),
               child: const Text('End trip'),
             ),
             FilledButton(
-              onPressed: () => Navigator.pop(c, true),
+              onPressed: () => Navigator.pop(context, true),
               child: const Text('Resume'),
             ),
           ],
         ),
       );
       if (resume == true) {
-        await _startTrip(confirm: false);
+        await _startTrip(showExplanation: false);
       } else {
         await prefs.setBool(_tripKey, false);
+        await _queueIdleFix();
+        await _flushQueue();
       }
     }
-    await _readQueue();
-    if (_queueSize > 0) _retryQueuedLocations();
-  }
-
-  Future<void> _readQueue() async {
-    final p = await SharedPreferences.getInstance();
-    if (mounted)
-      setState(() => _queueSize = (p.getStringList(_queueKey) ?? []).length);
   }
 
   Future<bool> _requestPermissions() async {
     if (!await Geolocator.isLocationServiceEnabled()) {
-      setState(
-        () =>
-            _message = 'Location services are off. Turn them on and try again.',
-      );
-      await Geolocator.openLocationSettings();
+      if (mounted) {
+        await showDialog<void>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Location is turned off'),
+            content: const Text(
+              'Turn on location services, then start the trip again.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  Navigator.pop(context);
+                  Geolocator.openLocationSettings();
+                },
+                child: const Text('Location settings'),
+              ),
+            ],
+          ),
+        );
+      }
       return false;
     }
-    var permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied)
-      permission = await Geolocator.requestPermission();
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
-      setState(
-        () => _message = permission == LocationPermission.deniedForever
-            ? 'Location access is blocked. Open settings and allow location.'
-            : 'Location permission is needed to share the bus location.',
+
+    var location = await Geolocator.checkPermission();
+    if (location == LocationPermission.denied) {
+      location = await Geolocator.requestPermission();
+    }
+    if (location == LocationPermission.deniedForever) {
+      await _showSettingsDialog(
+        'Location permission is blocked. Allow location access in app settings to share your bus position.',
       );
-      if (permission == LocationPermission.deniedForever)
-        await openAppSettings();
       return false;
     }
-    final background = await Permission.locationAlways.request();
-    if (!background.isGranted) {
-      setState(
-        () => _message =
-            'Allow background location so sharing continues when the screen is off.',
-      );
-      await openAppSettings();
-      return false;
+    if (location == LocationPermission.denied) return false;
+
+    if (Platform.isAndroid || Platform.isIOS) {
+      var always = await Permission.locationAlways.status;
+      if (!always.isGranted) always = await Permission.locationAlways.request();
+      if (!always.isGranted) {
+        if (always.isPermanentlyDenied) {
+          await _showSettingsDialog(
+            'Allow location all the time so sharing can continue while your screen is locked.',
+          );
+        } else if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Background location permission is needed during a driver trip.',
+              ),
+            ),
+          );
+        }
+        return false;
+      }
     }
-    if (await Permission.notification.isDenied)
-      await Permission.notification.request();
+
+    if (Platform.isAndroid) {
+      var notification = await Permission.notification.status;
+      if (!notification.isGranted) {
+        notification = await Permission.notification.request();
+      }
+      if (!notification.isGranted) {
+        await _showSettingsDialog(
+          'Allow notifications so Android can show the persistent trip-sharing status.',
+        );
+        return false;
+      }
+    }
     return true;
   }
 
-  Future<void> _startTrip({bool confirm = true}) async {
-    if (confirm) {
-      final ok = await showDialog<bool>(
-        context: context,
-        builder: (c) => AlertDialog(
-          title: const Text('Start sharing?'),
-          content: const Text(
-            'Your phone’s location will be shared with campus bus tracker while this trip is active.',
+  Future<void> _showSettingsDialog(String message) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Permission needed'),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(c, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(c, true),
-              child: const Text('Start trip'),
-            ),
-          ],
-        ),
-      );
-      if (ok != true) return;
-    }
-    final prefs = await SharedPreferences.getInstance();
-    if (prefs.getBool('driver_battery_tip_seen') != true && mounted) {
-      final openSettings = await showDialog<bool>(
-        context: context,
-        builder: (c) => AlertDialog(
-          title: const Text('Keep location sharing active'),
-          content: const Text(
-            'Some phone makers pause GPS in the background. You can allow unrestricted battery use so trips continue when the screen is off.',
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(context);
+              openAppSettings();
+            },
+            child: const Text('Open settings'),
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(c, false),
-              child: const Text('Later'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(c, true),
-              child: const Text('Battery settings'),
-            ),
-          ],
-        ),
-      );
-      await prefs.setBool('driver_battery_tip_seen', true);
-      if (openSettings == true)
-        await Permission.ignoreBatteryOptimizations.request();
-    }
-    if (!await _requestPermissions()) return;
-    await prefs.setBool(_tripKey, true);
-    await WakelockPlus.enable();
-    final LocationSettings settings =
-        defaultTargetPlatform == TargetPlatform.android
-        ? AndroidSettings(
-            accuracy: LocationAccuracy.high,
-            distanceFilter: 5,
-            foregroundNotificationConfig: ForegroundNotificationConfig(
-              notificationTitle: 'Campus Bus Tracker',
-              notificationText:
-                  'Sharing Bus ${context.read<AuthService>().currentUser?.busNumber ?? ''} location',
-              enableWakeLock: false,
-              setOngoing: true,
-            ),
-          )
-        : AppleSettings(
-            accuracy: LocationAccuracy.high,
-            distanceFilter: 5,
-            pauseLocationUpdatesAutomatically: false,
-            showBackgroundLocationIndicator: true,
-          );
-    setState(() {
-      _sharing = true;
-      _message = null;
-    });
-    _subscription = Geolocator.getPositionStream(locationSettings: settings).listen(
-      (position) {
-        _lastPosition = position;
-        _publish(position);
-        if (mounted) setState(() {});
-      },
-      onError: (_) {
-        if (mounted)
-          setState(
-            () => _message =
-                'GPS updates stopped. Check location settings and restart the trip.',
-          );
-      },
+        ],
+      ),
     );
   }
 
-  Future<void> _retryQueuedLocations() async {
-    if (_flushingQueue ||
-        _queueSize == 0 ||
-        (_retryAfter != null && DateTime.now().isBefore(_retryAfter!)))
-      return;
-    final token = context.read<AuthService>().currentUser?.token;
-    if (token == null) return;
-    try {
-      await _flushQueue(token);
-      _retryAfter = null;
-      _retryDelay = const Duration(seconds: 2);
-      _connected = true;
-      if (mounted) setState(() {});
-    } catch (e) {
-      if (e.toString().contains('SESSION_EXPIRED')) {
-        if (mounted)
-          setState(
-            () => _message =
-                'Session expired. Sign in again to send queued locations.',
-          );
-        await _stopStream();
-        return;
-      }
-      _connected = false;
-      _retryAfter = DateTime.now().add(_retryDelay);
-      _retryDelay = Duration(
-        seconds: (_retryDelay.inSeconds * 2).clamp(2, 60).toInt(),
+  Future<void> _startTrip({bool showExplanation = true}) async {
+    if (_busy || _sharing) return;
+    if (showExplanation) {
+      final accepted = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Start location sharing?'),
+          content: Text(
+            'While this trip is active, Bus $_busNumber location is shared with campus bus tracker so students can follow it. Android will keep a persistent notification visible.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Continue'),
+            ),
+          ],
+        ),
       );
-      if (mounted) setState(() {});
+      if (accepted != true) return;
+    }
+    setState(() {
+      _busy = true;
+      _message = null;
+    });
+    try {
+      if (!await _requestPermissions()) return;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_tripKey, true);
+      await WakelockPlus.enable();
+      final settings = Platform.isAndroid
+          ? AndroidSettings(
+              accuracy: LocationAccuracy.high,
+              distanceFilter: 5,
+              intervalDuration: const Duration(seconds: 2),
+              foregroundNotificationConfig: ForegroundNotificationConfig(
+                notificationTitle: 'Sharing Bus $_busNumber location',
+                notificationText:
+                    'Your trip is active. Tap End Trip when finished.',
+                notificationChannelName: 'Bus trip location sharing',
+                enableWakeLock: true,
+                setOngoing: true,
+              ),
+            )
+          : const LocationSettings(
+              accuracy: LocationAccuracy.high,
+              distanceFilter: 5,
+            );
+      _position = await Geolocator.getLastKnownPosition();
+      _lastQueuedAt = null;
+      _positionSubscription =
+          Geolocator.getPositionStream(locationSettings: settings).listen(
+            _onPosition,
+            onError: (Object error) {
+              if (mounted) setState(() => _message = 'GPS error: $error');
+            },
+          );
+      if (mounted) {
+        setState(() {
+          _sharing = true;
+          _message = null;
+        });
+      }
+      await _flushQueue();
+      _maybeShowBatteryTip();
+    } catch (error) {
+      if (mounted) {
+        setState(() => _message = 'Could not start location sharing: $error');
+      }
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_tripKey, false);
+      await WakelockPlus.disable();
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
-  Future<void> _publish(Position position) async {
-    if (position.accuracy > 50) return;
-    final now = DateTime.now();
-    final last = _lastSentPosition;
-    final moved = last == null
-        ? true
-        : Geolocator.distanceBetween(
-                last.latitude,
-                last.longitude,
-                position.latitude,
-                position.longitude,
-              ) >=
-              5;
-    if (_lastSentAt != null &&
-        now.difference(_lastSentAt!) < const Duration(seconds: 3))
-      return;
-    if (!moved &&
-        _lastSentAt != null &&
-        now.difference(_lastSentAt!) < const Duration(seconds: 15))
-      return;
-    final auth = context.read<AuthService>();
-    final user = auth.currentUser;
-    final token = user?.token;
-    final bus = user?.busNumber;
-    if (token == null || bus == null) {
-      setState(() => _message = 'Please sign in again to continue sharing.');
+  Future<void> _maybeShowBatteryTip() async {
+    if (!Platform.isAndroid || !mounted) return;
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool('driver_battery_tip_shown') == true) return;
+    await prefs.setBool('driver_battery_tip_shown', true);
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Keep sharing reliable'),
+        content: const Text(
+          'Some phones restrict background location to save battery. If updates stop with the screen locked, allow Campus Bus Tracker to run without battery optimization.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Later'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              final status = await Permission.ignoreBatteryOptimizations
+                  .request();
+              if (!status.isGranted) await openAppSettings();
+            },
+            child: const Text('Battery settings'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _onPosition(Position position) async {
+    if (position.accuracy > 50) {
+      if (mounted) {
+        setState(() {
+          _position = position;
+          _message =
+              'Waiting for a better GPS fix (accuracy must be 50m or better).';
+        });
+      }
       return;
     }
-    final payload = {
-      'busNumber': bus,
+    final now = DateTime.now();
+    final elapsed = _lastQueuedAt == null
+        ? 99.0
+        : now.difference(_lastQueuedAt!).inMilliseconds / 1000;
+    if (elapsed < 2.5) return;
+    final previous = _position;
+    final moved = previous == null
+        ? 999.0
+        : Geolocator.distanceBetween(
+            previous.latitude,
+            previous.longitude,
+            position.latitude,
+            position.longitude,
+          );
+    if (moved < 5 && elapsed < 12) {
+      if (mounted) setState(() => _position = position);
+      return;
+    }
+    _position = position;
+    _lastQueuedAt = now;
+    final fix = <String, dynamic>{
+      'busNumber': _busNumber,
       'lat': position.latitude,
       'lng': position.longitude,
-      'speed': position.speed * 3.6,
-      'heading': position.heading,
+      'speed': position.speed.isFinite && position.speed > 0
+          ? position.speed * 3.6
+          : 0,
+      'heading': position.heading.isFinite && position.heading >= 0
+          ? position.heading
+          : null,
       'accuracy': position.accuracy,
-      'status': position.speed * 3.6 < 1.5 ? 'idle' : 'running',
-      'timestamp': now.toUtc().toIso8601String(),
+      'timestamp': position.timestamp.toUtc().toIso8601String(),
     };
-    try {
-      while (_flushingQueue) {
-        await Future.delayed(const Duration(milliseconds: 50));
-      }
-      if (!_connected && _retryAfter != null && now.isBefore(_retryAfter!)) {
-        await _enqueue(payload);
-        return;
-      }
-      await _flushQueue(token);
-      if (_lastSentAt != null &&
-          DateTime.now().difference(_lastSentAt!) <
-              const Duration(seconds: 3)) {
-        await _enqueue(payload);
-        return;
-      }
-      await context.read<ApiService>().publishDriverLocation(token, payload);
-      _lastSentAt = DateTime.now();
-      _lastSentPosition = position;
-      _connected = true;
-      _retryAfter = null;
-      _retryDelay = const Duration(seconds: 2);
-      _message = null;
-    } catch (e) {
-      if (e.toString().contains('SESSION_EXPIRED')) {
-        await _enqueue(payload);
-        setState(
-          () => _message = 'Session expired. Sign in again to resume sharing.',
-        );
-        await _stopStream();
-        return;
-      }
-      _connected = false;
-      _retryAfter = DateTime.now().add(_retryDelay);
-      _retryDelay = Duration(
-        seconds: (_retryDelay.inSeconds * 2).clamp(2, 60).toInt(),
-      );
-      await _enqueue(payload);
-    }
-    if (mounted) setState(() {});
-  }
-
-  Future<void> _enqueue(Map<String, dynamic> payload) async {
-    final p = await SharedPreferences.getInstance();
-    final queue = p.getStringList(_queueKey) ?? [];
-    queue.add(jsonEncode(payload));
-    while (queue.length > 200) {
-      queue.removeAt(0);
-    }
-    await p.setStringList(_queueKey, queue);
-    await _readQueue();
-  }
-
-  Future<void> _flushQueue(String token) async {
-    if (_flushingQueue) {
-      while (_flushingQueue) {
-        await Future.delayed(const Duration(milliseconds: 50));
-      }
-      return _flushQueue(token);
-    }
-    _flushingQueue = true;
-    try {
-      final p = await SharedPreferences.getInstance();
-      final queue = p.getStringList(_queueKey) ?? [];
-      while (queue.isNotEmpty) {
-        if (_lastSentAt != null) {
-          final wait =
-              const Duration(seconds: 3) -
-              DateTime.now().difference(_lastSentAt!);
-          if (wait > Duration.zero) await Future.delayed(wait);
-        }
-        await context.read<ApiService>().publishDriverLocation(
-          token,
-          Map<String, dynamic>.from(jsonDecode(queue.first)),
-        );
-        _lastSentAt = DateTime.now();
-        queue.removeAt(0);
-        await p.setStringList(_queueKey, queue);
-      }
-      await _readQueue();
-    } finally {
-      _flushingQueue = false;
-    }
-  }
-
-  Future<void> _stopStream() async {
-    await _subscription?.cancel();
-    _subscription = null;
-    await WakelockPlus.disable();
-    if (mounted) setState(() => _sharing = false);
-  }
-
-  Future<void> _endTrip() async {
-    final pos = _lastSentPosition ?? _lastPosition;
-    final auth = context.read<AuthService>();
-    final bus = auth.currentUser?.busNumber;
-    final token = auth.currentUser?.token;
-    if (pos != null && token != null && bus != null && pos.accuracy <= 50) {
-      final finalFix = {
-        'busNumber': bus,
-        'lat': pos.latitude,
-        'lng': pos.longitude,
-        'speed': 0,
-        'heading': pos.heading,
-        'accuracy': pos.accuracy,
-        'status': 'idle',
-        'timestamp': DateTime.now().toUtc().toIso8601String(),
-      };
-      try {
-        await _flushQueue(token);
-        if (_lastSentAt != null) {
-          final wait =
-              const Duration(seconds: 3) -
-              DateTime.now().difference(_lastSentAt!);
-          if (wait > Duration.zero) await Future.delayed(wait);
-        }
-        await context.read<ApiService>().publishDriverLocation(token, finalFix);
-      } catch (_) {
-        await _enqueue(finalFix);
-      }
-    }
+    _lastFix = Map<String, dynamic>.from(fix);
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_tripKey, false);
-    await _stopStream();
+    await prefs.setString('driver_last_fix_$_busNumber', jsonEncode(_lastFix));
+    await _enqueueFix(fix);
+    await _flushQueue();
+    if (mounted) setState(() => _message = null);
   }
 
-  Future<void> _logout() async {
-    await _endTrip();
-    final auth = context.read<AuthService>();
+  Future<void> _enqueueFix(Map<String, dynamic> fix) async {
+    if (_queue.isNotEmpty &&
+        fix['status'] == null &&
+        _queue.last['status'] == 'idle') {
+      _queue.removeLast();
+    }
+    _queue.add(fix);
+    if (_queue.length > 200) _queue.removeAt(0);
+    await _saveQueue();
+  }
+
+  Future<void> _saveQueue() async {
+    final prefs = await SharedPreferences.getInstance();
+    _queueKey ??= 'driver_location_queue_$_busNumber';
+    await prefs.setString(_queueKey!, jsonEncode(_queue));
+  }
+
+  Future<void> _flushQueue() async {
+    if (_sending || _queue.isEmpty || _authExpired) return;
+    _sending = true;
     try {
-      if (auth.currentUser?.token case final token?)
-        await context.read<ApiService>().logout(token);
-    } catch (_) {}
-    await auth.logout();
-    if (mounted)
+      final token = context.read<AuthService>().currentUser?.token;
+      if (token == null) return;
+      final api = context.read<ApiService>();
+      while (_queue.isNotEmpty && mounted) {
+        final status = await api.sendDriverLocation(_queue.first, token);
+        if (status == 200) {
+          _queue.removeAt(0);
+          _lastSuccessfulSend = DateTime.now();
+          await _saveQueue();
+          if (mounted) setState(() {});
+          continue;
+        }
+        if (status == 401) {
+          await _handleExpiredSession();
+        } else if (mounted) {
+          setState(
+            () => _message = status == 403
+                ? 'Server rejected this bus assignment. Sign in again or contact a caretaker.'
+                : 'Location update is queued and will retry when the connection returns.',
+          );
+        }
+        break;
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(
+          () => _message =
+              'Offline: ${_queue.length} location update(s) queued for retry.',
+        );
+      }
+    } finally {
+      _sending = false;
+    }
+  }
+
+  Future<void> _handleExpiredSession() async {
+    if (_authExpired || !mounted) return;
+    _authExpired = true;
+    await _stopSharing(markTripEnded: false);
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Please sign in again'),
+        content: Text(
+          'Your session expired. ${_queue.length} queued location update(s) remain saved on this device.',
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    await context.read<AuthService>().logout();
+    if (mounted) {
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute(builder: (_) => const LoginScreen()),
         (_) => false,
       );
+    }
+  }
+
+  Future<void> _endTrip() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    await _queueIdleFix();
+    await _stopSharing(markTripEnded: true);
+    await _flushQueue();
+    if (mounted) setState(() => _busy = false);
+  }
+
+  Future<void> _queueIdleFix() async {
+    Map<String, dynamic>? finalFix;
+    final position = _position;
+    if (position != null && position.accuracy <= 50) {
+      finalFix = {
+        'busNumber': _busNumber,
+        'lat': position.latitude,
+        'lng': position.longitude,
+        'heading': position.heading,
+        'accuracy': position.accuracy,
+      };
+    } else if (_lastFix != null) {
+      finalFix = Map<String, dynamic>.from(_lastFix!);
+    } else if (_queue.isNotEmpty) {
+      finalFix = Map<String, dynamic>.from(_queue.last);
+    }
+    if (finalFix == null) return;
+    finalFix.addAll({
+      'speed': 0,
+      'timestamp': DateTime.now().toUtc().toIso8601String(),
+      'status': 'idle',
+    });
+    await _enqueueFix(finalFix);
+  }
+
+  Future<void> _stopSharing({required bool markTripEnded}) async {
+    await _positionSubscription?.cancel();
+    _positionSubscription = null;
+    if (markTripEnded) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_tripKey, false);
+    }
+    await WakelockPlus.disable();
+    if (mounted) setState(() => _sharing = false);
+  }
+
+  Future<void> _logout() async {
+    if (_sharing) await _endTrip();
+    if (!mounted) return;
+    await context.read<AuthService>().logout();
+    if (mounted) {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+        (_) => false,
+      );
+    }
   }
 
   @override
   void dispose() {
-    _subscription?.cancel();
-    _uiTimer?.cancel();
-    WakelockPlus.disable();
+    _positionSubscription?.cancel();
+    _queueTimer?.cancel();
+    _clockTimer?.cancel();
+    if (!_sharing) WakelockPlus.disable();
     super.dispose();
+  }
+
+  String _lastSentLabel() {
+    final sent = _lastSuccessfulSend;
+    if (sent == null) return 'No location sent yet';
+    final seconds = DateTime.now().difference(sent).inSeconds;
+    return 'Last sent ${seconds}s ago';
   }
 
   @override
   Widget build(BuildContext context) {
     final user = context.watch<AuthService>().currentUser;
-    final accuracy = _lastPosition?.accuracy;
+    final speed = _position?.speed.isFinite == true
+        ? (_position!.speed * 3.6).clamp(0, 250)
+        : 0.0;
     return Scaffold(
-      backgroundColor: const Color(0xfff5f5f5),
       appBar: AppBar(
-        title: const Text('Driver trip'),
+        title: const Text('Driver Trip'),
         actions: [
           IconButton(
-            onPressed: _logout,
-            tooltip: 'Logout',
+            tooltip: 'Fleet map',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const MapScreen()),
+            ),
+            icon: const Icon(Icons.map_outlined),
+          ),
+          IconButton(
+            tooltip: 'Log out',
+            onPressed: _busy ? null : _logout,
             icon: const Icon(Icons.logout),
           ),
         ],
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
-          Card(
-            child: ListTile(
-              leading: const CircleAvatar(child: Icon(Icons.directions_bus)),
-              title: Text(
-                'Bus ${user?.busNumber ?? '—'}',
-                style: const TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(20),
+          children: [
+            Card(
+              child: ListTile(
+                leading: const CircleAvatar(child: Icon(Icons.directions_bus)),
+                title: Text('Bus ${user?.busNumber ?? '—'}'),
+                subtitle: Text(user?.name ?? 'Driver'),
+                trailing: const Text('Assigned'),
               ),
-              subtitle: Text(user?.name ?? 'Driver'),
-              trailing: const Icon(Icons.lock_outline),
             ),
-          ),
-          const SizedBox(height: 16),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                children: [
-                  Icon(
-                    _sharing ? Icons.location_on : Icons.location_off,
-                    size: 42,
-                    color: _sharing ? Colors.green : Colors.grey,
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _sharing ? 'Sharing location' : 'Trip not started',
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
+            const SizedBox(height: 16),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          _sharing
+                              ? Icons.wifi_tethering
+                              : Icons.location_disabled,
+                          color: _sharing ? Colors.green : Colors.grey,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          _sharing ? 'Sharing location' : 'Trip not active',
+                          style: const TextStyle(
+                            fontSize: 17,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                  Text(
-                    _lastSentAt == null
-                        ? 'Waiting for first GPS fix'
-                        : 'Last sent ${DateTime.now().difference(_lastSentAt!).inSeconds}s ago',
-                  ),
-                  if (accuracy != null)
+                    const SizedBox(height: 14),
+                    Text(_lastSentLabel()),
+                    const SizedBox(height: 8),
+                    Text('Speed  ${speed.toStringAsFixed(1)} km/h'),
                     Text(
-                      'GPS accuracy ±${accuracy.toStringAsFixed(0)}m · ${accuracy <= 20
-                          ? 'Good'
-                          : accuracy <= 50
-                          ? 'Fair'
-                          : 'Poor'}',
+                      'GPS accuracy  ${_position?.accuracy.toStringAsFixed(0) ?? '—'} m',
                     ),
-                  Text(
-                    _lastPosition == null
-                        ? 'Speed —'
-                        : 'Speed ${(_lastPosition!.speed * 3.6).toStringAsFixed(0)} km/h',
-                  ),
-                  Text(
-                    'Connection: ${_connected ? 'Online' : 'Offline'} · queued fixes: $_queueSize',
-                  ),
-                ],
-              ),
-            ),
-          ),
-          if (_message != null)
-            Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                children: [
-                  Text(_message!, style: const TextStyle(color: Colors.red)),
-                  if (_message!.contains('Session expired'))
-                    TextButton(
-                      onPressed: () async {
-                        await context.read<AuthService>().logout();
-                        if (mounted)
-                          Navigator.pushReplacement(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => const LoginScreen(),
-                            ),
-                          );
-                      },
-                      child: const Text('Sign in again'),
-                    ),
-                ],
-              ),
-            ),
-          const SizedBox(height: 18),
-          SizedBox(
-            height: 56,
-            child: FilledButton.icon(
-              onPressed: _sharing ? _endTrip : _startTrip,
-              icon: Icon(_sharing ? Icons.stop : Icons.play_arrow),
-              label: Text(_sharing ? 'End Trip' : 'Start Trip'),
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextButton.icon(
-            onPressed: () => showDialog(
-              context: context,
-              builder: (c) => AlertDialog(
-                title: const Text('Battery settings'),
-                content: const Text(
-                  'Some phones stop background GPS to save battery. Set Campus Bus Tracker to unrestricted battery use in system settings.',
+                    if (_queue.isNotEmpty)
+                      Text('Queued updates  ${_queue.length}'),
+                  ],
                 ),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(c),
-                    child: const Text('Later'),
-                  ),
-                  FilledButton(
-                    onPressed: () async {
-                      Navigator.pop(c);
-                      await Permission.ignoreBatteryOptimizations.request();
-                    },
-                    child: const Text('Open settings'),
-                  ),
-                ],
               ),
             ),
-            icon: const Icon(Icons.battery_saver),
-            label: const Text('Battery optimization help'),
-          ),
-        ],
+            const SizedBox(height: 20),
+            SizedBox(
+              height: 58,
+              child: FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: _sharing
+                      ? Colors.red.shade700
+                      : Colors.green.shade700,
+                ),
+                onPressed: _busy
+                    ? null
+                    : (_sharing ? _endTrip : () => _startTrip()),
+                icon: _busy
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : Icon(_sharing ? Icons.stop : Icons.play_arrow, size: 28),
+                label: Text(
+                  _busy
+                      ? 'Please wait…'
+                      : (_sharing ? 'End Trip' : 'Start Trip'),
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ),
+            if (_message != null) ...[
+              const SizedBox(height: 16),
+              Text(
+                _message!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

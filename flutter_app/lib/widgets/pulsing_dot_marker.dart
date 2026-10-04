@@ -1,14 +1,27 @@
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 
-/// Google Maps circle overlay used as a compact, tappable bus marker.
+/// Fixed-size Google Maps markers: unlike map-space circles these remain the
+/// same visual size when the camera zoom changes. Alpha provides the pulse.
 class PulsingDotMarker {
-  static Set<Circle> build({required String id, required LatLng position, required bool running, required bool expanded, required VoidCallback onTap}) {
-    final circles = <Circle>{
-      Circle(circleId: CircleId('${id}_hit'), center: position, radius: 105, fillColor: Colors.transparent, strokeColor: Colors.transparent, onTap: onTap),
-      Circle(circleId: CircleId('${id}_dot'), center: position, radius: 22, fillColor: running ? const Color(0xFF2563EB) : const Color(0xFF94A3B8), strokeColor: Colors.white, strokeWidth: 2, onTap: onTap),
+  static Set<Marker> build({
+    required String id,
+    required LatLng position,
+    required bool running,
+    required bool expanded,
+    required VoidCallback onTap,
+  }) {
+    return {
+      Marker(
+        markerId: MarkerId(id),
+        position: position,
+        anchor: const Offset(.5, .5),
+        alpha: running && expanded ? 1 : .78,
+        icon: BitmapDescriptor.defaultMarkerWithHue(
+          running ? BitmapDescriptor.hueAzure : BitmapDescriptor.hueViolet,
+        ),
+        onTap: onTap,
+      ),
     };
-    if (running) circles.add(Circle(circleId: CircleId('${id}_pulse'), center: position, radius: expanded ? 58 : 36, fillColor: const Color(0x142563EB), strokeColor: const Color(0x772563EB).withValues(alpha: expanded ? .62 : .28), strokeWidth: 2, onTap: onTap));
-    return circles;
   }
 }
