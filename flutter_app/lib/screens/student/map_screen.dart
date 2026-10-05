@@ -85,6 +85,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   final Completer<GoogleMapController> _mapController =
       Completer<GoogleMapController>();
   final TextEditingController _searchController = TextEditingController();
+  final TextEditingController _issueController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
 
   List<BusLocation> _fleet = [];
@@ -230,6 +231,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   int _arrivalFixCount = 0;
   bool _isRerouting = false;
   Timer? _pulseTimer;
+  bool _isReportingIssue = false;
   bool _pulseExpanded = false;
 
   @override
@@ -291,6 +293,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _tts.stop();
     WakelockPlus.disable();
     _searchController.dispose();
+    _issueController.dispose();
     _searchFocusNode.dispose();
     // dispose any running animation controllers
     for (final c in _markerControllers.values) {
@@ -1242,47 +1245,33 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     await SharePlus.instance.share(ShareParams(text: text));
   }
 
-  Future<void> _reportIssue() async {
-    final controller = TextEditingController();
-    final report = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Report a bus issue'),
-        content: TextField(
-          controller: controller,
-          maxLines: 3,
-          decoration: const InputDecoration(
-            hintText: 'Describe a delay or issue',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text),
-            child: const Text('Send'),
-          ),
-        ],
-      ),
+  void _reportIssue() {
+    _issueController.clear();
+    setState(() => _isReportingIssue = true);
+  }
+
+  void _cancelIssueReport() {
+    _issueController.clear();
+    setState(() => _isReportingIssue = false);
+  }
+
+  Future<void> _submitIssueReport() async {
+    final report = _issueController.text.trim();
+    if (report.isEmpty) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getStringList('bus_issue_reports') ?? <String>[];
+    saved.add(
+      '${DateTime.now().toIso8601String()}|${_selectedBusKey ?? 'bus'}|$report',
     );
-    controller.dispose();
-    if (report != null && report.trim().isNotEmpty && mounted) {
-      final prefs = await SharedPreferences.getInstance();
-      final saved = prefs.getStringList('bus_issue_reports') ?? <String>[];
-      saved.add(
-        '${DateTime.now().toIso8601String()}|${_selectedBusKey ?? 'bus'}|${report.trim()}',
-      );
-      await prefs.setStringList('bus_issue_reports', saved);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Thanks. Your report has been saved for review.'),
-          ),
-        );
-      }
-    }
+    await prefs.setStringList('bus_issue_reports', saved);
+    if (!mounted) return;
+
+    setState(() => _isReportingIssue = false);
+    _issueController.clear();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Report saved on this device.')),
+    );
   }
 
   void _updateNavigationProgress() {
@@ -1719,8 +1708,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final circles = <Circle>{};
     if (_userPosition != null) {
       final accuracy = _userAccuracyMeters.isFinite ? _userAccuracyMeters : 0.0;
-      final clampedAccuracy = accuracy.clamp(0.0, 150.0);
-      if (accuracy > 0 && accuracy <= 100) {
+      final clampedAccuracy = accuracy.clamp(0.0, 25.0);
+      if (accuracy > 0 && accuracy <= 25) {
         circles.add(
           Circle(
             circleId: const CircleId('user_accuracy'),
@@ -1846,7 +1835,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         polylines: _routePolylines,
         mapType: mapType,
         mapStyle: mapStyle,
-        myLocationEnabled: _trackingUser,
+        myLocationEnabled: false,
       ),
     );
   }
@@ -2179,7 +2168,62 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                 label: const Text('Re-centre'),
               ),
             ),
-          if (_navigation.mode == MapMode.navigating)
+          if (_navigation.mode == MapMode.navigating && _isReportingIssue)
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: MediaQuery.paddingOf(context).bottom + 104,
+              child: Card(
+                elevation: 6,
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(Icons.report_problem_outlined),
+                          const SizedBox(width: 8),
+                          const Expanded(
+                            child: Text(
+                              'Report a bus issue',
+                              style: TextStyle(fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Close report form',
+                            onPressed: _cancelIssueReport,
+                            icon: const Icon(Icons.close),
+                          ),
+                        ],
+                      ),
+                      TextField(
+                        controller: _issueController,
+                        maxLines: 3,
+                        maxLength: 300,
+                        onChanged: (_) => setState(() {}),
+                        decoration: const InputDecoration(
+                          hintText: 'Describe a delay or issue',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: FilledButton.icon(
+                          onPressed: _issueController.text.trim().isEmpty
+                              ? null
+                              : _submitIssueReport,
+                          icon: const Icon(Icons.send),
+                          label: const Text('Send report'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          if (_navigation.mode == MapMode.navigating && !_isReportingIssue)
             Positioned(
               right: 18,
               bottom: 112,
