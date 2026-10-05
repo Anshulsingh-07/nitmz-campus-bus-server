@@ -15,6 +15,30 @@ class AuthService extends ChangeNotifier {
   bool get isAdmin => _currentUser?.isAdmin ?? false;
   bool get isDriver => _currentUser?.isDriver ?? false;
 
+  String _userFacingError(Object error) {
+    final raw = error.toString().replaceFirst('Exception: ', '').trim();
+    if (raw.isEmpty) {
+      return 'Something went wrong. Please try again.';
+    }
+    final text = raw.toLowerCase();
+    if (text.contains('<html') ||
+        text.contains('<!doctype html') ||
+        text.contains('formatexception') ||
+        text.contains('unexpected server response') ||
+        text.contains('invalid page')) {
+      return 'Unexpected server response — please try again.';
+    }
+    if (text.contains('invalid email') ||
+        text.contains('invalid credentials') ||
+        text.contains('incorrect pin') ||
+        text.contains('login failed') ||
+        text.contains('invalid password') ||
+        text.contains('not recognized')) {
+      return 'Invalid email or password';
+    }
+    return raw;
+  }
+
   Future<void> checkAuthState(ApiService api) async {
     final prefs = await SharedPreferences.getInstance();
     final token = prefs.getString('token');
@@ -135,7 +159,7 @@ class AuthService extends ChangeNotifier {
       notifyListeners();
       return true;
     } catch (e) {
-      _error = e.toString().replaceAll('Exception: ', '');
+      _error = _userFacingError(e);
       _isLoading = false;
       notifyListeners();
       return false;
@@ -166,7 +190,7 @@ class AuthService extends ChangeNotifier {
       notifyListeners();
       return true;
     } catch (e) {
-      _error = e.toString().replaceFirst('Exception: ', '');
+      _error = _userFacingError(e);
       _isLoading = false;
       notifyListeners();
       return false;

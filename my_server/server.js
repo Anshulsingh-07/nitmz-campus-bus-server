@@ -791,7 +791,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         const rows = await q('SELECT id, email, role FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
         if (rows.length) {
             const localPart = rows[0].email.split('@')[0];
-            const defaultPassword = localPart.slice(0, rows[0].role === 'caretaker' ? 13 : 9);
+            const defaultPassword = localPart.slice(0, 9);
             const passwordHash = await bcrypt.hash(defaultPassword, 12);
             await q('UPDATE users SET password = ?, must_change_password = true WHERE id = ?', [passwordHash, rows[0].id]);
             for (const [token, session] of sessions) {

@@ -19,8 +19,14 @@ class _ScheduleEditorState extends State<ScheduleEditor> {
   @override
   Widget build(BuildContext context) {
     final bus = context.watch<BusService>();
+    final auth = context.watch<AuthService>();
+    final caretakerHostel = auth.currentUser?.role == 'caretaker'
+      ? auth.currentUser?.hostelId
+      : null;
 
-    var buses = _selectedHostel != null
+    var buses = caretakerHostel != null
+      ? bus.getBusesByHostel(caretakerHostel)
+      : _selectedHostel != null
         ? bus.getBusesByHostel(_selectedHostel!)
         : bus.buses;
 
@@ -85,18 +91,21 @@ class _ScheduleEditorState extends State<ScheduleEditor> {
                     ],
                   ),
                 ),
-                const SizedBox(height: 8),
-                // Hostel filter
-                SizedBox(
-                  height: 34,
-                  child: ListView(
-                    scrollDirection: Axis.horizontal,
-                    children: [
-                      _chip('All', null),
-                      ...HostelModel.allHostels.map((h) => _chip(h.name, h.id)),
-                    ],
+                if (caretakerHostel == null) ...[
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: 34,
+                    child: ListView(
+                      scrollDirection: Axis.horizontal,
+                      children: [
+                        _chip('All', null),
+                        ...HostelModel.allHostels.map(
+                          (h) => _chip(h.name, h.id),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),

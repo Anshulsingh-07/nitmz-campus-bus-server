@@ -86,6 +86,36 @@ class ApiService {
     return headers;
   }
 
+  static String _unexpectedServerResponseMessage() =>
+      'Unexpected server response — please try again.';
+
+  static void _debugPrintResponse(String method, Uri uri, http.Response response) {
+    if (kDebugMode) {
+      debugPrint(
+        '$method $uri -> ${response.statusCode} ${response.headers['content-type'] ?? 'unknown'}',
+      );
+    }
+  }
+
+  static dynamic _decodeJsonResponse(http.Response response) {
+    final contentType = (response.headers['content-type'] ?? '').toLowerCase();
+    final body = response.body.trim();
+    if (contentType.isEmpty && body.isNotEmpty && !body.startsWith('{') && !body.startsWith('[')) {
+      throw Exception(_unexpectedServerResponseMessage());
+    }
+    if (!contentType.contains('application/json') &&
+        !contentType.contains('+json') &&
+        !body.startsWith('{') &&
+        !body.startsWith('[')) {
+      throw Exception(_unexpectedServerResponseMessage());
+    }
+    try {
+      return jsonDecode(body);
+    } on FormatException {
+      throw Exception(_unexpectedServerResponseMessage());
+    }
+  }
+
   Future<void> logout(String token) async {
     await http
         .post(Uri.parse('$baseUrl/auth/logout'), headers: _headers(token))
@@ -93,17 +123,23 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> login(String email, String password) async {
+    final uri = Uri.parse('$baseUrl/auth/login');
+    if (kDebugMode) debugPrint('Login request URL: $uri');
     try {
       final response = await http
           .post(
-            Uri.parse('$baseUrl/auth/login'),
+            uri,
             headers: _headers(),
             body: jsonEncode({'email': email, 'password': password}),
           )
           .timeout(const Duration(seconds: 10));
-      final data = jsonDecode(response.body);
-      if (response.statusCode == 200) return data;
-      throw Exception(data['error'] ?? 'Login failed');
+      _debugPrintResponse('POST', uri, response);
+      final data = _decodeJsonResponse(response);
+      if (response.statusCode == 200 && data is Map<String, dynamic>) return data;
+      if (data is Map<String, dynamic>) {
+        throw Exception(data['error'] ?? 'Invalid email or password');
+      }
+      throw Exception(_unexpectedServerResponseMessage());
     } catch (e) {
       if (e is TimeoutException || e is http.ClientException) {
         throw Exception(
@@ -152,22 +188,18 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> driverLogin(String phone, String pin) async {
+    final uri = Uri.parse('$baseUrl/auth/driver-login');
+    if (kDebugMode) debugPrint('Driver login request URL: $uri');
     try {
       final response = await http
           .post(
-            Uri.parse('$baseUrl/auth/driver-login'),
+            uri,
             headers: _headers(),
             body: jsonEncode({'phone': phone, 'pin': pin}),
           )
           .timeout(const Duration(seconds: 60));
-      dynamic data;
-      try {
-        data = jsonDecode(response.body);
-      } on FormatException {
-        throw Exception(
-          'Driver login service returned an invalid page. Check the API URL and backend deployment, then try again.',
-        );
-      }
+      _debugPrintResponse('POST', uri, response);
+      final data = _decodeJsonResponse(response);
       if (response.statusCode == 200 && data is Map<String, dynamic>) {
         return data;
       }
@@ -534,17 +566,18 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>?> getBus(int busNumber, {String? token}) async {
-    try {
-      final response = await http
-          .get(Uri.parse('$baseUrl/buses/$busNumber'), headers: _headers(token))
-          .timeout(const Duration(seconds: 8));
-      if (response.statusCode == 200) return jsonDecode(response.body);
-    } catch (e) {
-      // ignore
+    final response = await http
+        .get(Uri.parse('$baseUrl/buses/$busNumber'), headers: _headers(token))
+        .timeout(const Duration(seconds: 8));
+    final data = _tryDecodeJson(response.body);
+    if (response.statusCode == 200 && data is Map<String, dynamic>) {
+      return data;
     }
-    final demo = _getDemoBuses(null);
-    return demo.firstWhere((b) => b['busNumber'] == busNumber, orElse: () => {})
-        as Map<String, dynamic>?;
+    throw Exception(
+      data is Map<String, dynamic>
+          ? data['error']?.toString() ?? 'Could not load bus'
+          : 'Could not load bus',
+    );
   }
 
   Future<List<dynamic>> getTodayScheduledBuses({
@@ -574,37 +607,44 @@ class ApiService {
     String? date,
     String? token,
   }) async {
-    try {
-      String url = '$baseUrl/schedules?';
-      if (date != null) url += 'date=$date&';
-      if (hostel != null) url += 'hostel=$hostel';
-      final response = await http
-          .get(Uri.parse(url), headers: _headers(token))
-          .timeout(const Duration(seconds: 8));
-      if (response.statusCode == 200) return jsonDecode(response.body);
-    } catch (e) {
-      // ignore
-    }
-    return _getDemoSchedules(hostel);
+    final query = <String, String>{};
+    if (date != null) query['date'] = date;
+    if (hostel != null) query['hostel'] = hostel;
+    final uri = Uri.parse('$baseUrl/schedules').replace(
+      queryParameters: query.isEmpty ? null : query,
+    );
+    final response = await http
+        .get(uri, headers: _headers(token))
+        .timeout(const Duration(seconds: 8));
+    final data = _tryDecodeJson(response.body);
+    if (response.statusCode == 200 && data is List) return data;
+    throw Exception(
+      data is Map<String, dynamic>
+          ? data['error']?.toString() ?? 'Could not load schedules'
+          : 'Could not load schedules',
+    );
   }
 
   Future<Map<String, dynamic>> updateSchedule(
     Map<String, dynamic> data,
     String token,
   ) async {
-    try {
-      final response = await http
-          .post(
-            Uri.parse('$baseUrl/schedules'),
-            headers: _headers(token),
-            body: jsonEncode(data),
-          )
-          .timeout(const Duration(seconds: 10));
-      if (response.statusCode == 200) return jsonDecode(response.body);
-    } catch (e) {
-      // ignore
+    final response = await http
+        .post(
+          Uri.parse('$baseUrl/schedules'),
+          headers: _headers(token),
+          body: jsonEncode(data),
+        )
+        .timeout(const Duration(seconds: 10));
+    final body = _tryDecodeJson(response.body);
+    if (response.statusCode == 200 && body is Map<String, dynamic>) {
+      return body;
     }
-    return data;
+    throw Exception(
+      body is Map<String, dynamic>
+          ? body['error']?.toString() ?? 'Could not update schedule'
+          : 'Could not update schedule',
+    );
   }
 
   Future<Map<String, dynamic>> updateBusStatus(
@@ -705,41 +745,41 @@ class ApiService {
     String? hostel,
     String? token,
   }) async {
-    try {
-      final url = hostel != null
-          ? '$baseUrl/notifications?hostel=$hostel'
-          : '$baseUrl/notifications';
-      final response = await http
-          .get(Uri.parse(url), headers: _headers(token))
-          .timeout(const Duration(seconds: 8));
-      if (response.statusCode == 200) return jsonDecode(response.body);
-    } catch (e) {
-      // ignore
-    }
-    return _getDemoNotifications();
+    final uri = Uri.parse('$baseUrl/notifications').replace(
+      queryParameters: hostel == null ? null : {'hostel': hostel},
+    );
+    final response = await http
+        .get(uri, headers: _headers(token))
+        .timeout(const Duration(seconds: 8));
+    final data = _tryDecodeJson(response.body);
+    if (response.statusCode == 200 && data is List) return data;
+    throw Exception(
+      data is Map<String, dynamic>
+          ? data['error']?.toString() ?? 'Could not load notifications'
+          : 'Could not load notifications',
+    );
   }
 
   Future<Map<String, dynamic>> sendNotification(
     Map<String, dynamic> data,
     String token,
   ) async {
-    try {
-      final response = await http
-          .post(
-            Uri.parse('$baseUrl/notifications/send'),
-            headers: _headers(token),
-            body: jsonEncode(data),
-          )
-          .timeout(const Duration(seconds: 10));
-      if (response.statusCode == 200) return jsonDecode(response.body);
-    } catch (e) {
-      // ignore
+    final response = await http
+        .post(
+          Uri.parse('$baseUrl/notifications/send'),
+          headers: _headers(token),
+          body: jsonEncode(data),
+        )
+        .timeout(const Duration(seconds: 10));
+    final body = _tryDecodeJson(response.body);
+    if (response.statusCode == 200 && body is Map<String, dynamic>) {
+      return body;
     }
-    return {
-      ...data,
-      '_id': DateTime.now().millisecondsSinceEpoch.toString(),
-      'sentAt': DateTime.now().toIso8601String(),
-    };
+    throw Exception(
+      body is Map<String, dynamic>
+          ? body['error']?.toString() ?? 'Could not send notification'
+          : 'Could not send notification',
+    );
   }
 
   // ============ DEMO DATA ============

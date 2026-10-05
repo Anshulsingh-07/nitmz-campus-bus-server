@@ -1718,16 +1718,20 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final markers = <Marker>{};
     final circles = <Circle>{};
     if (_userPosition != null) {
-      circles.add(
-        Circle(
-          circleId: const CircleId('user_accuracy'),
-          center: _userPosition!,
-          radius: _userAccuracyMeters,
-          fillColor: const Color(0x332563EB),
-          strokeColor: const Color(0x662563EB),
-          strokeWidth: 1,
-        ),
-      );
+      final accuracy = _userAccuracyMeters.isFinite ? _userAccuracyMeters : 0.0;
+      final clampedAccuracy = accuracy.clamp(0.0, 150.0);
+      if (accuracy > 0 && accuracy <= 100) {
+        circles.add(
+          Circle(
+            circleId: const CircleId('user_accuracy'),
+            center: _userPosition!,
+            radius: clampedAccuracy,
+            fillColor: const Color(0x332563EB),
+            strokeColor: const Color(0x662563EB),
+            strokeWidth: 1,
+          ),
+        );
+      }
     }
     for (final entry in _stopDefinitions.entries) {
       final data = entry.value;
