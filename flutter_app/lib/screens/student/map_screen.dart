@@ -85,7 +85,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   final Completer<GoogleMapController> _mapController =
       Completer<GoogleMapController>();
   final TextEditingController _searchController = TextEditingController();
-  final TextEditingController _issueController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
 
   List<BusLocation> _fleet = [];
@@ -94,6 +93,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   bool _isLoading = true;
   bool _isConnected = false;
+  String _connectionStatus = 'Connecting';
   bool _isRefreshing = false;
   bool _isWaking = false;
   bool _isSyncing = false;
@@ -231,7 +231,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   int _arrivalFixCount = 0;
   bool _isRerouting = false;
   Timer? _pulseTimer;
-  bool _isReportingIssue = false;
   bool _pulseExpanded = false;
 
   @override
@@ -293,7 +292,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _tts.stop();
     WakelockPlus.disable();
     _searchController.dispose();
-    _issueController.dispose();
     _searchFocusNode.dispose();
     // dispose any running animation controllers
     for (final c in _markerControllers.values) {
@@ -402,6 +400,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     setState(() {
       _fleet = next;
       _isConnected = true;
+      _connectionStatus = 'Connected';
       _isLoading = false;
       _isWaking = false;
       _lastUpdate = DateTime.now();
@@ -412,6 +411,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   Future<void> _syncFleet({bool silent = false, bool showToast = false}) async {
     if (!mounted || _isSyncing) return;
     _isSyncing = true;
+    if (!_isConnected && mounted) {
+      setState(() => _connectionStatus = 'Reconnecting');
+    }
     _wakingTimer?.cancel();
     _wakingTimer = Timer(const Duration(seconds: 8), () {
       if (mounted && _isSyncing) setState(() => _isWaking = true);
@@ -450,19 +452,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         fleet = _mergeLatestTelemetry(fleet, latest);
       }
 
-      if (fleet.isEmpty) {
-        fleet = busService.buses.map((b) {
-          return BusLocation(
-            busId: 'Bus ${b.busNumber}',
-            deviceId: 'device-${b.busNumber}',
-            lat: b.latitude,
-            lng: b.longitude,
-            speed: b.speed,
-            accuracy: 1.0,
-            status: b.status,
-            timestamp: DateTime.now(),
-          );
-        }).toList();
+      // Preserve previously received server positions when today's schedule
+      // is empty. Never label local seed coordinates as a fresh GPS reading.
+      if (fleet.isEmpty && _fleet.isNotEmpty) {
+        fleet = List<BusLocation>.from(_fleet);
       }
 
       final selectedKey =
@@ -523,7 +516,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _isLoading = false;
         _isRefreshing = false;
         _isWaking = false;
-        _isConnected = latest != null;
+        // Reaching this point means the authenticated bus endpoint and the
+        // latest-location endpoint both returned successfully. GPS freshness
+        // is tracked separately from server connectivity via each bus timestamp.
+        _isConnected = true;
+        _connectionStatus = 'Connected';
         _error = null;
         _lastUpdate = DateTime.now();
       });
@@ -544,6 +541,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _isRefreshing = false;
         _isWaking = false;
         _isConnected = false;
+        _connectionStatus = _fleet.isEmpty ? 'Offline' : 'Showing cached data';
         _error = e.toString().replaceAll('Exception: ', '');
       });
 
@@ -1123,7 +1121,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             scrollController: controller,
             bus: bus,
             route: _routeLabel(bus),
-            updated: _lastUpdate == null ? 'just now' : _timeAgo(_lastUpdate!),
+            updated: _timeAgo(bus.timestamp),
             running: running,
             nextStop: running && bus.assignedHostel.isNotEmpty
                 ? '${bus.assignedHostel} · ${_nextStopEta(bus)}'
@@ -1245,33 +1243,47 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     await SharePlus.instance.share(ShareParams(text: text));
   }
 
-  void _reportIssue() {
-    _issueController.clear();
-    setState(() => _isReportingIssue = true);
-  }
-
-  void _cancelIssueReport() {
-    _issueController.clear();
-    setState(() => _isReportingIssue = false);
-  }
-
-  Future<void> _submitIssueReport() async {
-    final report = _issueController.text.trim();
-    if (report.isEmpty) return;
-
-    final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getStringList('bus_issue_reports') ?? <String>[];
-    saved.add(
-      '${DateTime.now().toIso8601String()}|${_selectedBusKey ?? 'bus'}|$report',
+  Future<void> _reportIssue() async {
+    final controller = TextEditingController();
+    final report = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Report a bus issue'),
+        content: TextField(
+          controller: controller,
+          maxLines: 3,
+          decoration: const InputDecoration(
+            hintText: 'Describe a delay or issue',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text),
+            child: const Text('Send'),
+          ),
+        ],
+      ),
     );
-    await prefs.setStringList('bus_issue_reports', saved);
-    if (!mounted) return;
-
-    setState(() => _isReportingIssue = false);
-    _issueController.clear();
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Report saved on this device.')),
-    );
+    controller.dispose();
+    if (report != null && report.trim().isNotEmpty && mounted) {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getStringList('bus_issue_reports') ?? <String>[];
+      saved.add(
+        '${DateTime.now().toIso8601String()}|${_selectedBusKey ?? 'bus'}|${report.trim()}',
+      );
+      await prefs.setStringList('bus_issue_reports', saved);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Thanks. Your report has been saved for review.'),
+          ),
+        );
+      }
+    }
   }
 
   void _updateNavigationProgress() {
@@ -1759,12 +1771,17 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             markerId: MarkerId('bus_$key'),
             position: point,
             rotation: _animatedHeadings[key] ?? bus.heading,
+            alpha: _running(bus) && !_isStale(bus)
+                ? (_pulseExpanded ? 1 : .68)
+                : 1,
             icon: _isStale(bus)
                 ? BitmapDescriptor.defaultMarker
                 : BitmapDescriptor.defaultMarkerWithHue(
-                    _navigation.mode == MapMode.routePreview
-                        ? BitmapDescriptor.hueRed
-                        : BitmapDescriptor.hueGreen,
+                    _running(bus)
+                        ? BitmapDescriptor.hueAzure
+                        : (_navigation.mode == MapMode.routePreview
+                              ? BitmapDescriptor.hueRed
+                              : BitmapDescriptor.hueGreen),
                   ),
             anchor: const Offset(.5, .5),
             onTap: () => _showBusDetails(bus),
@@ -2168,62 +2185,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                 label: const Text('Re-centre'),
               ),
             ),
-          if (_navigation.mode == MapMode.navigating && _isReportingIssue)
-            Positioned(
-              left: 16,
-              right: 16,
-              bottom: MediaQuery.paddingOf(context).bottom + 104,
-              child: Card(
-                elevation: 6,
-                child: Padding(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Row(
-                        children: [
-                          const Icon(Icons.report_problem_outlined),
-                          const SizedBox(width: 8),
-                          const Expanded(
-                            child: Text(
-                              'Report a bus issue',
-                              style: TextStyle(fontWeight: FontWeight.w600),
-                            ),
-                          ),
-                          IconButton(
-                            tooltip: 'Close report form',
-                            onPressed: _cancelIssueReport,
-                            icon: const Icon(Icons.close),
-                          ),
-                        ],
-                      ),
-                      TextField(
-                        controller: _issueController,
-                        maxLines: 3,
-                        maxLength: 300,
-                        onChanged: (_) => setState(() {}),
-                        decoration: const InputDecoration(
-                          hintText: 'Describe a delay or issue',
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                      Align(
-                        alignment: Alignment.centerRight,
-                        child: FilledButton.icon(
-                          onPressed: _issueController.text.trim().isEmpty
-                              ? null
-                              : _submitIssueReport,
-                          icon: const Icon(Icons.send),
-                          label: const Text('Send report'),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          if (_navigation.mode == MapMode.navigating && !_isReportingIssue)
+          if (_navigation.mode == MapMode.navigating)
             Positioned(
               right: 18,
               bottom: 112,
@@ -2281,7 +2243,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                     children: [
                       Expanded(
                         child: Text(
-                          'Connection lost · showing last known locations',
+                          '$_connectionStatus · GPS fix ${_fleet.isEmpty ? 'unknown' : _timeAgo(_findByKey(_fleet, _selectedBusKey)?.timestamp ?? _fleet.first.timestamp)}'
+                          '${_lastUpdate == null ? '' : ' · server last reached ${_timeAgo(_lastUpdate!)}'}'
+                          '${_error == null ? '' : ' · $_error'}',
                           style: TextStyle(
                             color: theme.colorScheme.onErrorContainer,
                           ),
