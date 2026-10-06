@@ -140,11 +140,11 @@ class _StudentDashboard extends StatelessWidget {
     // A bus scheduled for today but not yet moving stays in Today's Schedule,
     // with its departure time visible; only moving buses appear in Running now.
     final scheduledToday = todaySchedules
-      .where(
-        (s) =>
-          _scheduleDateTime(s)?.isAfter(now) == true &&
-          bus.getBusByNumber(s.busNumber)?.status != 'running',
-      )
+        .where(
+          (s) =>
+              _scheduleDateTime(s)?.isAfter(now) == true &&
+              bus.getBusByNumber(s.busNumber)?.status != 'running',
+        )
         .map((s) => _withSchedule(bus.getBusByNumber(s.busNumber), s))
         .whereType<BusModel>()
         .toList();
@@ -524,7 +524,10 @@ BusModel? _withSchedule(BusModel? bus, ScheduleModel schedule) => bus == null
     ? null
     : BusModel(
         busNumber: bus.busNumber,
+        name: bus.name,
         assignedHostel: bus.assignedHostel,
+        sourcePlace: bus.sourcePlace,
+        destinationPlace: bus.destinationPlace,
         status: bus.status,
         latitude: bus.latitude,
         longitude: bus.longitude,
