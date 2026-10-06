@@ -26,9 +26,9 @@
   Although the current file is ignored and no longer tracked, rotate both values
   before going live. The historical DB host, username, and database name were
   also exposed as configuration metadata.
-- `docker-compose.yml` also contained a committed database password. It now
-  reads credentials from environment variables. Rotate the historical database
-  password anywhere it was used before deployment.
+- `docker-compose.yml` also contained a committed `MYSQL_ROOT_PASSWORD`. It now
+  reads the PostgreSQL password from `DB_PASSWORD`. Rotate the historical
+  MySQL root password anywhere it was reused before deployment.
 - `my_server/server.js` contained a fixed fallback telemetry API key; the
   fallback is removed. Rotate any telemetry key that matched that historical
   source value because it was committed in Git history.
@@ -50,13 +50,13 @@ rejects non-bcrypt legacy database values; users whose existing records contain
 plaintext passwords must reset their password before logging in.
 
 Password reset is rate-limited per email in-process and sets
-`must_change_password` before allowing other authenticated API actions. Student
-temporary passwords use the first 9 characters of the email local part;
-caretaker temporary passwords use the first 13 as requested. These defaults are
-predictable, and the current reset endpoint does not prove mailbox ownership or
-send the generated password to that mailbox. Add an email verification step
-before exposing password reset publicly; otherwise an attacker who knows a
-caretaker email can reset that caretaker's password.
+`must_change_password` before allowing other authenticated API actions. The
+temporary password uses the first 9 characters of the registered email local
+part for every account. This default is predictable, and the current reset
+endpoint does not prove mailbox ownership or send the generated password to
+that mailbox. Add an email verification step before exposing password reset
+publicly; otherwise an attacker who knows an account email can reset that
+account's password.
 
 ## Registration identity pattern
 
@@ -74,3 +74,55 @@ authorized source confirming the institute's actual naming pattern.
 - The server does not use JWT signing: session tokens are random in-memory tokens. There is no `JWT_SECRET` variable to configure.
 - `DATABASE_URL` is an optional supported alternative to `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME`; the Render Blueprint uses the split variables.
 - Local `.env` files are ignored and are not tracked. Example env files contain placeholders only.
+
+## Verification for this checkout
+
+- Read-only inspection of the configured database found six accounts, all with the
+  `caretaker-<hostel>` local-part shape, and no student or staff accounts. Those
+  records confirm the `@nitmz.ac.in` domain and caretaker hostel identity, but do
+  not confirm the requested student roll-number regex. All six have a non-null
+  `hostel_id`. The example
+  `bt24cs034@nitmz.ac.in` is therefore not treated as a database-verified format.
+  Registration currently enforces that sample shape (`btYYCCNNN@nitmz.ac.in`)
+  because it is the only concrete student format in the request. Confirm the
+  pattern with an authoritative student/staff account source before opening
+  registration in production.
+- Current backend login selects an account by email and accepts it only when
+  `bcrypt.compare` matches its stored bcrypt hash. The authenticated role and
+  hostel are sourced from that database row. Public registration creates only
+  student records. No current source fallback or demo credential was found in
+  the repository scan.
+- The previous client-side bypass was in
+  `flutter_app/lib/services/api_service.dart`: unreachable/failed logins could
+  return fabricated demo users and tokens. Demo email/password values were
+  prefilled and displayed by `flutter_app/lib/screens/auth/login_screen.dart`.
+  `my_server/server.js` also created demo users when the user table was empty.
+  The current diff removes those three paths; the real backend now decides login.
+- `git log --all --full-history -- "*.env"` confirms historical
+  `my_server/.env` commits. The checked-in history also included a Compose
+  database password, a fixed telemetry API key in the backend, and a Google Maps
+  client key in Flutter platform files. Rotate the historical API key, database
+  password, Compose password (if distinct), and Maps key; restrict the replacement
+  Maps key to the application and APIs in use. No history rewrite was performed.
+- Current backend secret inputs are `API_SECRET_KEY`, `DATABASE_URL` or the
+  split `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_SSL`, and
+  optional `PG_POOL_MAX`. Native Maps keys are supplied through platform build
+  settings (`MAPS_API_KEY`). The Flutter API origin is `API_BASE_URL`; it is
+  configuration, not a secret. Supabase client values are optional Dart defines
+  and are not used by the backend.
+- The current project ignore rules cover `.env` files, `node_modules`, Flutter
+  build and tool outputs, Android build outputs, iOS Pods, IDE files, signing
+  credentials, and Python bytecode. The real local env files are ignored and are
+  not tracked in the current index. `my_server/server.log` is not tracked now.
+- The ignored local `my_server/.env` defines `API_SECRET_KEY`, `DB_PASSWORD`,
+  database connection fields, and an unused `MAPBOX_TOKEN`. The ignored
+  `flutter_app/.env` defines Maps/Mapbox client keys, while
+  `flutter_app/.env.local` contains API endpoint configuration. Flutter does not
+  load those dotenv files at runtime; use backend process env vars and Flutter
+  build defines/platform settings instead. Their values were not printed during
+  this audit. Keep them ignored and rotate any value that matches a historical
+  credential listed above.
+- Password reset is rate limited by email in process memory and forces a password
+  change. Its derived password is predictable and reset does not verify mailbox
+  ownership; protect the endpoint with verified email delivery before relying on
+  it for accounts exposed to untrusted users.

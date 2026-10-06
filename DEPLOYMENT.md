@@ -7,16 +7,18 @@ not revoke values in old commits. Before production deployment:
 
 - Replace the historical `API_SECRET_KEY` from `my_server/.env` and update any
   ESP32 sender that uses it.
-- Change the PostgreSQL password exposed in `my_server/.env` and
-  `docker-compose.yml`; update the hosted database and Render environment.
+- Change the PostgreSQL password exposed in `my_server/.env`; update the hosted
+  database and Render environment. Rotate the separate historical
+  `MYSQL_ROOT_PASSWORD` from `docker-compose.yml` anywhere it was reused.
 - Replace/restrict the Google Maps API key committed in
-  `flutter_app/ios/Runner/AppDelegate.swift` and `Info.plist` in commit
-  `1c85b04`. It is a client key, but has been publicly exposed and should be
-  restricted to the app and required APIs.
+  `flutter_app/android/gradle.properties`, the iOS `AppDelegate.swift` and
+  `Info.plist`, and `flutter_app/web/index.html` in commit `1c85b04`. It is a
+  client key, but has been publicly exposed and should be restricted to the app
+  and required APIs.
 
-History includes `my_server/.env` in commits `772b473` and `959565b`, the Compose
-password in `772b473`, and the Maps key in `1c85b04`. History has not been
-rewritten.
+History includes `my_server/.env` in commits `772b473` and `959565b`, the
+Compose `MYSQL_ROOT_PASSWORD` in `1c85b04`, and Maps key source values in the
+Flutter platform files in `1c85b04`. History has not been rewritten.
 
 ## 1. Prepare the database
 
@@ -26,7 +28,9 @@ The backend runs schema initialization and sample hostel/bus seeding during
 startup; there is no separate migration command. Review/remove sample records
 before production use. Create caretaker/admin accounts through a trusted,
 access-controlled database process; public registration creates student
-accounts only.
+accounts only. The backend does not sign JWTs: login sessions use random
+in-memory tokens, so there is no JWT secret to generate. Create a fresh
+telemetry key with `openssl rand -hex 32` for `API_SECRET_KEY`.
 
 For local development, copy `my_server/.env.example` to `my_server/.env`, set
 real local values, then run `npm install` and `npm start` from `my_server/`.
@@ -55,13 +59,11 @@ publicly.
 
 ## Password resets
 
-The current temporary-password behavior is role-specific: students receive the
-first 9 characters of their email local part, and caretakers receive the first
-13. For `caretaker-gh1@nitmz.ac.in`, that temporary password is
-`caretaker-gh1`; the app requires a new password immediately after sign-in.
-This reset endpoint does not verify mailbox ownership or send the temporary
-password, so add a verified email reset flow before making password reset
-available on a public production deployment.
+The reset endpoint sets the password to the first 9 characters of the
+registered email's local part and requires the user to change it after sign-in.
+The endpoint does not verify mailbox ownership or deliver the derived password.
+Because the password is predictable, restrict reset access or add a verified
+email reset flow before exposing this endpoint publicly.
 
 ## 3. Build the Flutter release APK
 

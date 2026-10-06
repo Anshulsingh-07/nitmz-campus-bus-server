@@ -78,6 +78,9 @@ const driverLastFixes = new Map();
 
 const today = () => new Date().toISOString().slice(0, 10);
 const uid = (prefix) => `${prefix}${crypto.randomBytes(6).toString('hex')}`;
+// Student roll IDs use the published example shape BT24CS034. The configured
+// account table currently contains caretaker identities only; see SECURITY_NOTES.md.
+const COLLEGE_STUDENT_EMAIL = /^bt\d{2}[a-z]{2}\d{3}@nitmz\.ac\.in$/i;
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -123,7 +126,10 @@ function mapSchedule(row) {
 function mapBus(row) {
     return {
         busNumber: row.bus_number,
+        name: row.bus_name || `Bus ${row.bus_number}`,
         assignedHostel: row.assigned_hostel,
+        sourcePlace: row.source_place || row.assigned_hostel,
+        destinationPlace: row.destination_place || 'MBSE',
         status: row.status,
         latitude: Number(row.latitude),
         longitude: Number(row.longitude),
@@ -242,7 +248,10 @@ function createToken(user) {
 const BUS_SELECT = `
 SELECT
   b.bus_number,
+  b.bus_name,
   b.assigned_hostel,
+  b.source_place,
+  b.destination_place,
   b.status,
   b.latitude,
   b.longitude,
@@ -347,7 +356,10 @@ CREATE TABLE IF NOT EXISTS users (
     await q(`
 CREATE TABLE IF NOT EXISTS buses (
   bus_number INT PRIMARY KEY,
+  bus_name VARCHAR(80) NOT NULL DEFAULT '',
   assigned_hostel VARCHAR(10) NOT NULL,
+  source_place VARCHAR(120) NOT NULL DEFAULT '',
+  destination_place VARCHAR(120) NOT NULL DEFAULT '',
   status VARCHAR(20) NOT NULL DEFAULT 'idle',
   latitude NUMERIC(10,6) NOT NULL,
   longitude NUMERIC(10,6) NOT NULL,
@@ -358,6 +370,12 @@ CREATE TABLE IF NOT EXISTS buses (
   FOREIGN KEY (assigned_hostel) REFERENCES hostels(id)
 );
 `);
+    await q("ALTER TABLE buses ADD COLUMN IF NOT EXISTS bus_name VARCHAR(80) NOT NULL DEFAULT ''");
+    await q("ALTER TABLE buses ADD COLUMN IF NOT EXISTS source_place VARCHAR(120) NOT NULL DEFAULT ''");
+    await q("ALTER TABLE buses ADD COLUMN IF NOT EXISTS destination_place VARCHAR(120) NOT NULL DEFAULT ''");
+    await q("UPDATE buses SET bus_name = 'Bus ' || bus_number::text WHERE bus_name = ''");
+    await q("UPDATE buses SET source_place = assigned_hostel WHERE source_place = ''");
+    await q("UPDATE buses SET destination_place = 'MBSE' WHERE destination_place = ''");
 
     await q(`
 CREATE TABLE IF NOT EXISTS drivers (
@@ -454,18 +472,14 @@ CREATE TABLE IF NOT EXISTS telemetry (
         }
     }
 
-    const [telemetryCountRow] = await q('SELECT COUNT(*) AS count FROM telemetry');
-    const telemetryCount = telemetryCountRow ? Number(telemetryCountRow.count) : 0;
-    if (telemetryCount === 0) {
-        await q(
-            'INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, ts, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-            ['ESP32-1', '5', 23.7271, 92.7176, 0, 1.0, null, 'idle']
-        );
-    }
 }
 
 app.get('/', (_req, res) => {
     res.json({ status: 'ok', message: 'Campus Bus Tracker API running (PostgreSQL)' });
+});
+
+app.get('/api', (_req, res) => {
+    res.json({ status: 'ok', message: 'Campus Bus Tracker API running' });
 });
 
 app.get('/api/health', async (_req, res) => {
@@ -477,7 +491,8 @@ app.get('/api/health', async (_req, res) => {
         ]);
         res.json({ status: 'ok', hostels: hostels.count, buses: buses.count, notifications: notifications.count });
     } catch (error) {
-        res.status(500).json({ status: 'error', message: error.message });
+        console.error('Health database query failed:', error.message);
+        res.status(500).json({ status: 'error', message: 'Database query failed' });
     }
 });
 
@@ -497,8 +512,8 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(400).json({ error: 'name, email, and password are required' });
         }
         const normalizedEmail = String(email).trim().toLowerCase();
-        if (!normalizedEmail.endsWith('@nitmz.ac.in')) {
-            return res.status(400).json({ error: 'Use your NIT Mizoram email address' });
+        if (!COLLEGE_STUDENT_EMAIL.test(normalizedEmail)) {
+            return res.status(400).json({ error: 'Use your college roll-number email, e.g. bt24cs034@nitmz.ac.in' });
         }
 
         const existing = await q('SELECT id FROM users WHERE LOWER(email) = LOWER(?)', [normalizedEmail]);
@@ -602,7 +617,8 @@ app.get('/api/buses/stream', async (req, res) => {
 
     try {
         if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
-        const hostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : null;
+        // Students can browse buses across hostels; caretakers remain scoped.
+        const hostel = auth.role === 'caretaker' ? auth.hostelId : null;
         const rows = await q(`
             SELECT b.bus_number, b.assigned_hostel, b.status, b.latitude, b.longitude, b.speed, b.route,
                    t.lat, t.lng, t.heading, t.has_fix, t.satellites, t.hdop, t.net_type, t.status AS telemetry_status, t.received_at
@@ -650,9 +666,10 @@ app.get('/api/buses/stream', async (req, res) => {
         res.setHeader('Connection', 'keep-alive');
         res.flushHeaders?.();
         res.write(`data: ${JSON.stringify(initialData)}\n\n`);
+        console.info('Telemetry stream connected', { role: auth.role, hostel: hostel || 'all', initialBusCount: initialData.length });
 
         const onUpdate = (data) => {
-            if (['student', 'caretaker'].includes(auth.role) && (!auth.hostelId || auth.hostelId.toUpperCase() !== String(data.assigned_hostel || '').toUpperCase())) return;
+            if (auth.role === 'caretaker' && (!auth.hostelId || auth.hostelId.toUpperCase() !== String(data.assigned_hostel || '').toUpperCase())) return;
             const eventData = { ...data };
             if (auth.role === 'student') {
                 delete eventData.satellites;
@@ -660,7 +677,10 @@ app.get('/api/buses/stream', async (req, res) => {
                 delete eventData.net_type;
                 delete eventData.netType;
             }
-            if (res.writable) res.write(`data: ${JSON.stringify([eventData])}\n\n`);
+            if (res.writable) {
+                res.write(`data: ${JSON.stringify([eventData])}\n\n`);
+                console.info('Telemetry stream event delivered', { busNumber: data.busNumber || data.bus_number, role: auth.role });
+            }
         };
         const heartbeat = setInterval(() => {
             if (res.writable) res.write(': keep-alive\n\n');
@@ -669,6 +689,7 @@ app.get('/api/buses/stream', async (req, res) => {
         req.on('close', () => {
             clearInterval(heartbeat);
             telemetryEmitter.removeListener('live_update', onUpdate);
+            console.info('Telemetry stream closed', { role: auth.role });
         });
     } catch (error) {
         if (!res.headersSent) return res.status(500).json({ error: error.message });
@@ -798,7 +819,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
                 if (session.userId === rows[0].id) sessions.delete(token);
             }
         }
-        return res.json({ message: 'If this account exists, a default password has been set. Check your email format, then change it after signing in.' });
+        return res.json({ message: 'If this account exists, its temporary password is the first 9 characters of the email before @. You must change it after signing in.' });
     } catch (error) {
         return res.status(500).json({ error: 'Password reset is temporarily unavailable' });
     }
@@ -1003,7 +1024,7 @@ app.post('/api/buses', async (req, res) => {
     if (!auth) return;
 
     try {
-        const { busNumber, assignedHostel, driverName, driverPhone, pin, latitude, longitude, route } = req.body || {};
+        const { busNumber, name, sourcePlace, destinationPlace, assignedHostel, driverName, driverPhone, pin, latitude, longitude, route } = req.body || {};
         if (busNumber === undefined || !String(driverName || '').trim() || !String(driverPhone || '').trim() || !/^\d{6}$/.test(String(pin || ''))) {
             return res.status(400).json({ error: 'busNumber, driverName, driverPhone, and a 6-digit PIN are required' });
         }
@@ -1026,10 +1047,13 @@ app.post('/api/buses', async (req, res) => {
         try {
             await client.query('BEGIN');
             await client.query(
-            'INSERT INTO buses (bus_number, assigned_hostel, status, latitude, longitude, speed, is_enabled, route) VALUES ($1, $2, $3, $4, $5, $6, true, $7)',
+            'INSERT INTO buses (bus_number, bus_name, assigned_hostel, source_place, destination_place, status, latitude, longitude, speed, is_enabled, route) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10)',
             [
                 Number(busNumber),
+                String(name || `Bus ${busNumber}`).trim(),
                 targetHostel,
+                String(sourcePlace || targetHostel).trim(),
+                String(destinationPlace || 'MBSE').trim(),
                 'idle',
                 latitude !== undefined ? Number(latitude) : 23.7271,
                 longitude !== undefined ? Number(longitude) : 92.7176,
@@ -1225,8 +1249,32 @@ app.patch('/api/buses/:busNumber', async (req, res) => {
 
         if (req.body.status !== undefined) {
             const status = String(req.body.status).toLowerCase();
+            if (!['idle', 'running', 'maintenance'].includes(status)) {
+                return res.status(400).json({ error: 'status must be idle, running, or maintenance' });
+            }
             updates.push('status = ?', 'speed = ?');
             params.push(status, status === 'running' ? 25 : 0);
+        }
+        if (req.body.route !== undefined) {
+            const route = String(req.body.route).trim();
+            if (!route || route.length > 120) {
+                return res.status(400).json({ error: 'route must contain 1 to 120 characters' });
+            }
+            updates.push('route = ?');
+            params.push(route);
+        }
+        for (const [field, column, maxLength] of [
+            ['name', 'bus_name', 80],
+            ['sourcePlace', 'source_place', 120],
+            ['destinationPlace', 'destination_place', 120],
+        ]) {
+            if (req.body[field] === undefined) continue;
+            const value = String(req.body[field]).trim();
+            if (!value || value.length > maxLength) {
+                return res.status(400).json({ error: `${field} must contain 1 to ${maxLength} characters` });
+            }
+            updates.push(`${column} = ?`);
+            params.push(value);
         }
         if (req.body.latitude !== undefined) {
             updates.push('latitude = ?');
@@ -1339,10 +1387,15 @@ app.post('/api/notifications/send', async (req, res) => {
 });
 
 app.post('/api/location', async (req, res) => {
+    console.info('Driver location request received', { route: req.path, busNumber: req.body?.busNumber });
     const auth = requireAuth(req, res, ['driver']);
-    if (!auth) return;
+    if (!auth) {
+        console.warn('Driver location authentication rejected', { route: req.path });
+        return;
+    }
     const busNumber = Number(req.body?.busNumber);
     if (!Number.isInteger(busNumber) || busNumber !== Number(auth.busNumber)) {
+        console.warn('Driver location validation rejected', { busNumber, reason: 'assignment_mismatch' });
         return res.status(403).json({ error: 'This token can update only its assigned bus' });
     }
     const lat = Number(req.body?.lat);
@@ -1355,6 +1408,7 @@ app.post('/api/location', async (req, res) => {
         !Number.isFinite(clientSpeed) || clientSpeed < 0 || clientSpeed > 250 ||
         !Number.isFinite(accuracy) || accuracy < 0 || accuracy > 50 || Number.isNaN(timestamp.getTime()) ||
         timestamp.getTime() > Date.now() + 5 * 60 * 1000) {
+        console.warn('Driver location validation rejected', { busNumber, reason: 'invalid_fix' });
         return res.status(400).json({ error: 'Invalid GPS fix; location accuracy must be 50m or better' });
     }
 
@@ -1369,7 +1423,10 @@ app.post('/api/location', async (req, res) => {
             }
         }
     }
-    if (previous && timestamp.getTime() <= previous.timestamp) return res.json({ ok: true, stale: true });
+    if (previous && timestamp.getTime() <= previous.timestamp) {
+        console.warn('Driver location validation rejected', { busNumber, reason: 'stale_fix', fixTime: timestamp.toISOString() });
+        return res.json({ ok: true, stale: true });
+    }
     const point = { lat, lng, timestamp: timestamp.getTime() };
     let speed = clientSpeed;
     let heading = Number(req.body?.heading);
@@ -1387,7 +1444,10 @@ app.post('/api/location', async (req, res) => {
     const status = requestedStatus || (speed > 1.5 ? 'running' : 'idle');
     const buses = await q(`SELECT b.assigned_hostel FROM buses b JOIN drivers d ON d.bus_number=b.bus_number
         WHERE b.bus_number=? AND b.is_enabled=true AND d.id=? AND d.is_active=true`, [busNumber, auth.userId]);
-    if (!buses.length) return res.status(403).json({ error: 'Driver assignment is no longer active' });
+    if (!buses.length) {
+        console.warn('Driver location validation rejected', { busNumber, reason: 'inactive_assignment' });
+        return res.status(403).json({ error: 'Driver assignment is no longer active' });
+    }
 
     try {
         const client = await pool.connect();
@@ -1403,6 +1463,7 @@ app.post('/api/location', async (req, res) => {
         } finally {
             client.release();
         }
+        console.info('Driver location persisted', { busNumber, deviceId: `driver:${auth.userId}`, fixTime: timestamp.toISOString() });
         const accepted = { ...point, speed };
         driverLastFixes.set(busNumber, accepted);
         const update = {
@@ -1413,9 +1474,10 @@ app.post('/api/location', async (req, res) => {
             lastUpdated: timestamp.toISOString(),
         };
         telemetryEmitter.emit('live_update', update);
+        console.info('Telemetry stream event emitted', { busNumber, source: 'driver' });
         return res.status(200).json({ ok: true });
     } catch (error) {
-        console.error('Driver location update failed:', error.message);
+        console.error('Driver location persistence failed', { busNumber, message: error.message });
         return res.status(500).json({ error: 'Could not store location update' });
     }
 });
@@ -1424,8 +1486,11 @@ app.post('/api/update-location', async (req, res) => {
     if (!API_SECRET_KEY) {
         return res.status(503).json({ error: 'Telemetry ingestion is not configured' });
     }
+    const busHint = req.body?.bus_id ?? req.body?.bus_number ?? req.body?.busId ?? req.body?.bus ?? null;
+    console.info('Telemetry request received', { route: req.path, busId: busHint });
     const clientKey = req.header('x-api-key');
     if (clientKey !== API_SECRET_KEY) {
+        console.warn('Telemetry authentication failed', { route: req.path });
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -1433,21 +1498,38 @@ app.post('/api/update-location', async (req, res) => {
         const telemetry = normalizeTelemetry(req.body || {});
         const { lat: latNum, lng: lngNum, speed: speedNum, accuracy: accuracyNum } = telemetry;
         if (!Number.isFinite(latNum) || !Number.isFinite(lngNum) || Math.abs(latNum) > 90 || Math.abs(lngNum) > 180 || !Number.isFinite(speedNum) || speedNum < 0 || !Number.isFinite(accuracyNum)) {
+            console.warn('Telemetry validation failed', { busId: telemetry.busId, reason: 'invalid_fix' });
             return res.status(400).json({ error: 'A valid latitude, longitude, speed, and accuracy are required.' });
         }
 
         const normalizedStatus = telemetry.status === 'active' ? 'running' : telemetry.status;
         const busNumber = Number(String(telemetry.busId || '').replace(/[^0-9]/g, ''));
-        if (!Number.isInteger(busNumber) || busNumber <= 0) return res.status(400).json({ error: 'A valid bus_id is required.' });
+        if (!Number.isInteger(busNumber) || busNumber <= 0) {
+            console.warn('Telemetry validation failed', { busId: telemetry.busId, reason: 'invalid_bus_id' });
+            return res.status(400).json({ error: 'A valid bus_id is required.' });
+        }
         const buses = await q('SELECT assigned_hostel FROM buses WHERE bus_number=? AND is_enabled=true', [busNumber]);
-        if (!buses.length) return res.status(404).json({ error: 'Bus not registered or disabled' });
+        if (!buses.length) {
+            console.warn('Telemetry validation failed', { busId: telemetry.busId, reason: 'bus_unavailable' });
+            return res.status(404).json({ error: 'Bus not registered or disabled' });
+        }
 
-        await q(
-            'INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, has_fix, satellites, hdop, net_type, ts, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [telemetry.deviceId, telemetry.busId, latNum, lngNum, speedNum, accuracyNum, telemetry.hasFix ?? true, telemetry.satellites, telemetry.hdop, telemetry.netType, telemetry.timestamp || new Date().toISOString(), normalizedStatus]
-        );
-
-        await q('UPDATE buses SET latitude = ?, longitude = ?, speed = ?, status = ? WHERE bus_number = ?', [latNum, lngNum, speedNum, normalizedStatus, busNumber]);
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            await client.query(
+                'INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, has_fix, satellites, hdop, net_type, ts, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)',
+                [telemetry.deviceId, telemetry.busId, latNum, lngNum, speedNum, accuracyNum, telemetry.hasFix ?? true, telemetry.satellites, telemetry.hdop, telemetry.netType, telemetry.timestamp || new Date().toISOString(), normalizedStatus]
+            );
+            await client.query('UPDATE buses SET latitude = $1, longitude = $2, speed = $3, status = $4 WHERE bus_number = $5', [latNum, lngNum, speedNum, normalizedStatus, busNumber]);
+            await client.query('COMMIT');
+        } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+        } finally {
+            client.release();
+        }
+        console.info('Telemetry persisted', { busId: String(busNumber), receivedAt: new Date().toISOString() });
         telemetryEmitter.emit('live_update', {
             bus_number: busNumber,
             busNumber,
@@ -1466,7 +1548,8 @@ app.post('/api/update-location', async (req, res) => {
 
         return res.status(200).json({ message: 'Data received successfully', status: 'success' });
     } catch (error) {
-        return res.status(500).json({ error: error.message });
+        console.error('Telemetry write failed', { busId: busHint, message: error.message });
+        return res.status(500).json({ error: 'Could not store location update' });
     }
 });
 
@@ -1475,6 +1558,7 @@ app.get('/api/location/latest', async (_req, res) => {
                 const rows = await q(
                         `
             SELECT
+                id,
                 device_id,
                 bus_id,
                 lat,
@@ -1483,33 +1567,30 @@ app.get('/api/location/latest', async (_req, res) => {
                 accuracy,
                 ts,
                 status,
-                to_char(received_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS received_at
+                received_at AT TIME ZONE 'UTC' AS received_at
             FROM telemetry
-            ORDER BY received_at DESC
+            ORDER BY received_at DESC, id DESC
             LIMIT 1
             `
                 );
 
         if (!rows.length) {
-            return res.json({
-                status: 'success',
-                data: {
-                    deviceId: 'ESP32-Device-1',
-                    busId: 'Bus 5',
-                    lat: 23.7271,
-                    lng: 92.7176,
-                    speed: 0,
-                    accuracy: 1.0,
-                    timestamp: new Date().toISOString(),
-                    status: 'idle',
-                },
-            });
+            console.info('Latest telemetry query completed', { found: false });
+            return res.json({ status: 'success', data: null });
         }
 
         const latest = rows[0];
         const busRaw = latest.bus_id || '5';
         const busDigits = String(busRaw).replace(/[^0-9]/g, '');
         const busId = busDigits ? `Bus ${busDigits}` : String(busRaw);
+        console.info('Latest telemetry query completed', {
+            found: true,
+            telemetryId: latest.id,
+            deviceId: latest.device_id,
+            busId,
+            receivedAt: latest.received_at,
+            fixTime: latest.ts,
+        });
 
         return res.json({
             status: 'success',
@@ -1520,12 +1601,17 @@ app.get('/api/location/latest', async (_req, res) => {
                 lng: Number(latest.lng),
                 speed: Number(latest.speed || 0),
                 accuracy: Number(latest.accuracy || 1.0),
-                timestamp: latest.ts || latest.received_at,
+                // Use database receipt time for freshness; device clocks are
+                // exposed separately and cannot make a newly received fix stale.
+                timestamp: latest.received_at,
+                deviceTimestamp: latest.ts,
+                receivedAt: latest.received_at,
                 status: latest.status || 'idle',
             },
         });
     } catch (error) {
-        return res.status(500).json({ error: error.message });
+        console.error('Latest location query failed:', error.message);
+        return res.status(500).json({ error: 'Could not retrieve latest location' });
     }
 });
 
@@ -1558,19 +1644,30 @@ app.get('/get-location', async (_req, res) => {
             `
                 );
 
-                const latest = rows[0] || { lat: 23.7271, lng: 92.7176, received_at: new Date().toISOString() };
+                const latest = rows[0];
+        if (!latest) return res.status(404).json({ error: 'No telemetry has been received' });
         return res.json({ latitude: Number(latest.lat), longitude: Number(latest.lng), timestamp: latest.received_at });
     } catch (error) {
-        return res.status(500).json({ status: 'Error', message: error.message });
+        console.error('Legacy location query failed:', error.message);
+        return res.status(500).json({ status: 'Error', message: 'Could not retrieve latest location' });
     }
+});
+
+app.use((req, res) => {
+    res.status(404).json({ error: 'Route not found' });
+});
+
+app.use((error, _req, res, _next) => {
+    console.error('Unhandled request error:', error.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
 });
 
 async function start() {
     try {
         await initializeDatabase();
+        console.info('PostgreSQL database initialized successfully');
         app.listen(port, '0.0.0.0', () => {
             console.log(`Server running on port ${port}`);
-            console.log(`PostgreSQL: ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}`);
             console.log(`ESP32 secure endpoint: http://<YOUR_PC_IP>:${port}/api/update-location`);
             console.log(`Flutter latest endpoint: http://<YOUR_PC_IP>:${port}/api/location/latest`);
         });

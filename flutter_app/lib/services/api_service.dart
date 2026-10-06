@@ -29,7 +29,7 @@ class ApiService {
     final now = DateTime.now();
     final backoffUntil = _telemetryBackoffUntil[endpoint];
     if (backoffUntil != null && now.isBefore(backoffUntil)) {
-      return null;
+      throw Exception('Location service retry backoff is active');
     }
 
     try {
@@ -39,10 +39,11 @@ class ApiService {
       if (kDebugMode) {
         debugPrint('Telemetry GET $endpoint -> ${response.statusCode}');
       }
+      final data = _decodeJsonResponse(response);
       if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
         if (data is Map<String, dynamic>) {
           _telemetryBackoffUntil.remove(endpoint);
+          if (data.containsKey('data') && data['data'] == null) return null;
           final payload = data['data'] is Map<String, dynamic>
               ? data['data'] as Map<String, dynamic>
               : data;
@@ -57,8 +58,10 @@ class ApiService {
         }
       }
 
-      _telemetryBackoffUntil[endpoint] = DateTime.now().add(
-        _telemetryEndpointBackoff,
+      throw Exception(
+        data is Map<String, dynamic>
+            ? (data['error']?.toString() ?? 'Location request failed')
+            : 'Location request failed',
       );
     } catch (e) {
       _telemetryBackoffUntil[endpoint] = DateTime.now().add(
@@ -67,9 +70,8 @@ class ApiService {
       if (kDebugMode) {
         debugPrint('Telemetry fetch failed for $endpoint: $e');
       }
+      rethrow;
     }
-
-    return null;
   }
 
   static Future<List<BusLocation>> getAllBusesLocations({String? token}) async {
@@ -89,7 +91,11 @@ class ApiService {
   static String _unexpectedServerResponseMessage() =>
       'Unexpected server response — please try again.';
 
-  static void _debugPrintResponse(String method, Uri uri, http.Response response) {
+  static void _debugPrintResponse(
+    String method,
+    Uri uri,
+    http.Response response,
+  ) {
     if (kDebugMode) {
       debugPrint(
         '$method $uri -> ${response.statusCode} ${response.headers['content-type'] ?? 'unknown'}',
@@ -100,7 +106,10 @@ class ApiService {
   static dynamic _decodeJsonResponse(http.Response response) {
     final contentType = (response.headers['content-type'] ?? '').toLowerCase();
     final body = response.body.trim();
-    if (contentType.isEmpty && body.isNotEmpty && !body.startsWith('{') && !body.startsWith('[')) {
+    if (contentType.isEmpty &&
+        body.isNotEmpty &&
+        !body.startsWith('{') &&
+        !body.startsWith('[')) {
       throw Exception(_unexpectedServerResponseMessage());
     }
     if (!contentType.contains('application/json') &&
@@ -135,7 +144,9 @@ class ApiService {
           .timeout(const Duration(seconds: 10));
       _debugPrintResponse('POST', uri, response);
       final data = _decodeJsonResponse(response);
-      if (response.statusCode == 200 && data is Map<String, dynamic>) return data;
+      if (response.statusCode == 200 && data is Map<String, dynamic>) {
+        return data;
+      }
       if (data is Map<String, dynamic>) {
         throw Exception(data['error'] ?? 'Invalid email or password');
       }
@@ -158,7 +169,7 @@ class ApiService {
           body: jsonEncode({'email': email.trim().toLowerCase()}),
         )
         .timeout(const Duration(seconds: 10));
-    final data = jsonDecode(response.body);
+    final data = _decodeJsonResponse(response);
     if (response.statusCode == 200 && data is Map<String, dynamic>) {
       return data['message']?.toString() ??
           'If this account exists, a default password has been set. Check your email format.';
@@ -178,7 +189,9 @@ class ApiService {
           body: jsonEncode({'newPassword': newPassword}),
         )
         .timeout(const Duration(seconds: 10));
-    final data = response.body.isNotEmpty ? jsonDecode(response.body) : null;
+    final data = response.body.isNotEmpty
+        ? _decodeJsonResponse(response)
+        : null;
     if (response.statusCode == 200) return;
     throw Exception(
       data is Map<String, dynamic>
@@ -220,7 +233,9 @@ class ApiService {
     final response = await http
         .get(Uri.parse('$baseUrl/auth/driver/me'), headers: _headers(token))
         .timeout(const Duration(seconds: 15));
-    final data = response.body.isNotEmpty ? jsonDecode(response.body) : null;
+    final data = response.body.isNotEmpty
+        ? _decodeJsonResponse(response)
+        : null;
     if (response.statusCode == 200 &&
         data is Map<String, dynamic> &&
         data['user'] is Map<String, dynamic>) {
@@ -295,7 +310,9 @@ class ApiService {
         .get(Uri.parse('$baseUrl/me'), headers: _headers(token))
         .timeout(const Duration(seconds: 8));
 
-    final data = response.body.isNotEmpty ? jsonDecode(response.body) : null;
+    final data = response.body.isNotEmpty
+        ? _decodeJsonResponse(response)
+        : null;
     if (response.statusCode == 200 && data is Map<String, dynamic>) {
       final user = data['user'];
       if (user is Map<String, dynamic>) return user;
@@ -313,7 +330,7 @@ class ApiService {
         .get(Uri.parse(baseUrl))
         .timeout(const Duration(seconds: 8));
     final data = response.body.isNotEmpty
-        ? jsonDecode(response.body)
+        ? _decodeJsonResponse(response)
         : <String, dynamic>{};
     if (response.statusCode == 200 && data is Map<String, dynamic>) return data;
     throw Exception(
@@ -328,7 +345,7 @@ class ApiService {
         .get(Uri.parse('$baseUrl/health'))
         .timeout(const Duration(seconds: 8));
     final data = response.body.isNotEmpty
-        ? jsonDecode(response.body)
+        ? _decodeJsonResponse(response)
         : <String, dynamic>{};
     if (response.statusCode == 200 && data is Map<String, dynamic>) return data;
     throw Exception(
@@ -343,7 +360,7 @@ class ApiService {
         .get(Uri.parse('$baseUrl/hostels'))
         .timeout(const Duration(seconds: 8));
     if (response.statusCode == 200) {
-      final parsed = jsonDecode(response.body);
+      final parsed = _decodeJsonResponse(response);
       if (parsed is List) return parsed;
       if (parsed is Map<String, dynamic>) {
         final data = parsed['data'];
@@ -368,7 +385,7 @@ class ApiService {
         .get(Uri.parse(url), headers: _headers(token))
         .timeout(const Duration(seconds: 8));
     if (response.statusCode == 200) {
-      final parsed = jsonDecode(response.body);
+      final parsed = _decodeJsonResponse(response);
       if (parsed is List) return parsed;
       if (parsed is Map<String, dynamic>) {
         final data = parsed['data'];
@@ -390,7 +407,7 @@ class ApiService {
         )
         .timeout(const Duration(seconds: 8));
     if (response.statusCode == 200) {
-      final parsed = jsonDecode(response.body);
+      final parsed = _decodeJsonResponse(response);
       if (parsed is List) return parsed;
       if (parsed is Map<String, dynamic>) {
         final data = parsed['data'];
@@ -419,7 +436,7 @@ class ApiService {
             }),
           )
           .timeout(const Duration(seconds: 10));
-      final data = jsonDecode(response.body);
+      final data = _decodeJsonResponse(response);
       if (response.statusCode == 200 || response.statusCode == 201) return data;
       throw Exception(data['error'] ?? 'Registration failed');
     } catch (e) {
@@ -488,7 +505,7 @@ class ApiService {
         }
 
         if (response.statusCode == 200) {
-          final decoded = jsonDecode(response.body);
+          final decoded = _decodeJsonResponse(response);
           final items = decoded is List
               ? decoded
               : decoded is Map<String, dynamic>
@@ -593,7 +610,7 @@ class ApiService {
           headers: _headers(token),
         )
         .timeout(const Duration(seconds: 10));
-    final data = jsonDecode(response.body);
+    final data = _decodeJsonResponse(response);
     if (response.statusCode == 200 && data is List) return data;
     throw Exception(
       data is Map<String, dynamic>
@@ -610,9 +627,9 @@ class ApiService {
     final query = <String, String>{};
     if (date != null) query['date'] = date;
     if (hostel != null) query['hostel'] = hostel;
-    final uri = Uri.parse('$baseUrl/schedules').replace(
-      queryParameters: query.isEmpty ? null : query,
-    );
+    final uri = Uri.parse(
+      '$baseUrl/schedules',
+    ).replace(queryParameters: query.isEmpty ? null : query);
     final response = await http
         .get(uri, headers: _headers(token))
         .timeout(const Duration(seconds: 8));
@@ -661,7 +678,7 @@ class ApiService {
         .timeout(const Duration(seconds: 10));
 
     final data = response.body.isNotEmpty
-        ? jsonDecode(response.body)
+        ? _decodeJsonResponse(response)
         : <String, dynamic>{};
     if (response.statusCode == 200) {
       return data is Map<String, dynamic>
@@ -683,6 +700,9 @@ class ApiService {
     required String driverPhone,
     required String pin,
     required String token,
+    String? name,
+    String? sourcePlace,
+    String? destinationPlace,
   }) async {
     final response = await http
         .post(
@@ -690,7 +710,10 @@ class ApiService {
           headers: _headers(token),
           body: jsonEncode({
             'busNumber': busNumber,
+            if (name != null) 'name': name,
             'assignedHostel': assignedHostel,
+            if (sourcePlace != null) 'sourcePlace': sourcePlace,
+            if (destinationPlace != null) 'destinationPlace': destinationPlace,
             'driverName': driverName,
             'driverPhone': driverPhone,
             'pin': pin,
@@ -698,7 +721,7 @@ class ApiService {
         )
         .timeout(const Duration(seconds: 10));
 
-    final data = jsonDecode(response.body);
+    final data = _decodeJsonResponse(response);
     if (response.statusCode == 200 || response.statusCode == 201) {
       return data is Map<String, dynamic> ? data : <String, dynamic>{};
     }
@@ -707,6 +730,35 @@ class ApiService {
       data is Map<String, dynamic>
           ? data['error'] ?? 'Failed to add bus'
           : 'Failed to add bus',
+    );
+  }
+
+  Future<Map<String, dynamic>> updateBusDetails({
+    required int busNumber,
+    required String name,
+    required String sourcePlace,
+    required String destinationPlace,
+    required String token,
+  }) async {
+    final response = await http
+        .patch(
+          Uri.parse('$baseUrl/buses/$busNumber'),
+          headers: _headers(token),
+          body: jsonEncode({
+            'name': name,
+            'sourcePlace': sourcePlace,
+            'destinationPlace': destinationPlace,
+          }),
+        )
+        .timeout(const Duration(seconds: 10));
+    final data = _decodeJsonResponse(response);
+    if (response.statusCode == 200 && data is Map<String, dynamic>) {
+      return data;
+    }
+    throw Exception(
+      data is Map<String, dynamic>
+          ? data['error'] ?? 'Failed to update bus details'
+          : 'Failed to update bus details',
     );
   }
 
@@ -729,7 +781,7 @@ class ApiService {
         )
         .timeout(const Duration(seconds: 10));
 
-    final data = jsonDecode(response.body);
+    final data = _decodeJsonResponse(response);
     if (response.statusCode == 200) {
       return data is Map<String, dynamic> ? data : <String, dynamic>{};
     }
@@ -745,9 +797,9 @@ class ApiService {
     String? hostel,
     String? token,
   }) async {
-    final uri = Uri.parse('$baseUrl/notifications').replace(
-      queryParameters: hostel == null ? null : {'hostel': hostel},
-    );
+    final uri = Uri.parse(
+      '$baseUrl/notifications',
+    ).replace(queryParameters: hostel == null ? null : {'hostel': hostel});
     final response = await http
         .get(uri, headers: _headers(token))
         .timeout(const Duration(seconds: 8));
@@ -780,385 +832,5 @@ class ApiService {
           ? body['error']?.toString() ?? 'Could not send notification'
           : 'Could not send notification',
     );
-  }
-
-  // ============ DEMO DATA ============
-  List<Map<String, dynamic>> _getDemoBuses(String? hostelFilter) {
-    final today = DateTime.now().toIso8601String().split('T')[0];
-    final allBuses = [
-      _bus(
-        1,
-        'GH1',
-        'Pa Hlutea',
-        '9436168711',
-        23.7285,
-        92.7180,
-        'idle',
-        today,
-        '8:30 AM',
-        '1:30 PM',
-      ),
-      _bus(
-        2,
-        'GH1',
-        'Pu Stephen',
-        '8787778119',
-        23.7260,
-        92.7165,
-        'running',
-        today,
-        '9:15 AM',
-        '4:30 PM',
-      ),
-      _bus(
-        3,
-        'GH1',
-        'Mawizuala',
-        '8131811729',
-        23.7290,
-        92.7200,
-        'idle',
-        today,
-        '8:30 AM',
-        '5:30 PM',
-      ),
-      _bus(
-        4,
-        'GH2',
-        'Hruaia',
-        '6909101103',
-        23.7240,
-        92.7150,
-        'running',
-        today,
-        '8:15 AM',
-        '4:30 PM',
-      ),
-      _bus(
-        5,
-        'BH1',
-        'Chhuanga',
-        '9862369186',
-        23.7275,
-        92.7185,
-        'running',
-        today,
-        '8:15 AM',
-        '5:30 PM',
-      ),
-      _bus(
-        6,
-        'BH1',
-        'Pa Dina',
-        '9615408299',
-        23.7265,
-        92.7170,
-        'idle',
-        today,
-        '8:15 AM',
-        '7:00 PM',
-      ),
-      _bus(
-        7,
-        'BH1',
-        'Vk-a',
-        '7005367693',
-        23.7280,
-        92.7195,
-        'running',
-        today,
-        '8:15 PM',
-        '5:30 PM',
-      ),
-      _bus(
-        8,
-        'BH1',
-        'Dama',
-        '7005364878',
-        23.7255,
-        92.7160,
-        'idle',
-        today,
-        '6:30 AM',
-        '12:30 PM',
-        note: 'IoN Digital Centre Mualpui',
-      ),
-      _bus(
-        9,
-        'BH1',
-        'Mala',
-        '6009425695',
-        23.7295,
-        92.7205,
-        'maintenance',
-        today,
-        '1:00 PM',
-        '4:30 PM',
-      ),
-      _bus(
-        10,
-        'BH1',
-        'Rinkima',
-        '7005616947',
-        23.7270,
-        92.7175,
-        'idle',
-        today,
-        '9:15 AM',
-        '1:30 PM',
-      ),
-      _bus(
-        11,
-        'BH1',
-        'Pa Dika',
-        '6909470121',
-        23.7250,
-        92.7155,
-        'running',
-        today,
-        '9:15 AM',
-        '1:30 PM',
-      ),
-      _bus(
-        12,
-        'BH1',
-        'Ramtea',
-        '8729985255',
-        23.7285,
-        92.7190,
-        'idle',
-        today,
-        '10:15 AM',
-        '2:30 PM',
-      ),
-      _bus(
-        13,
-        'BH2',
-        'Lalrammawia',
-        '9862411234',
-        23.7260,
-        92.7165,
-        'running',
-        today,
-        '9:20 AM',
-        '2:00 PM',
-      ),
-      _bus(
-        14,
-        'BH2',
-        'Vanlalruata',
-        '8014567890',
-        23.7245,
-        92.7148,
-        'idle',
-        today,
-        '8:20 AM',
-        '3:20 PM',
-      ),
-      _bus(
-        15,
-        'BH2',
-        'Zohmingliana',
-        '7005223344',
-        23.7300,
-        92.7210,
-        'running',
-        today,
-        '8:20 AM',
-        '11:15 AM',
-      ),
-      _bus(
-        16,
-        'BH3',
-        'Lalduhawma',
-        '9856112233',
-        23.7230,
-        92.7140,
-        'idle',
-        today,
-        '8:00 AM',
-        '4:00 PM',
-      ),
-      _bus(
-        17,
-        'BH3',
-        'Vanlalngaia',
-        '6009334455',
-        23.7315,
-        92.7215,
-        'running',
-        today,
-        '9:00 AM',
-        '5:00 PM',
-      ),
-      _bus(
-        18,
-        'BH3',
-        'Hmingthansanga',
-        '7005556677',
-        23.7240,
-        92.7155,
-        'idle',
-        today,
-        '8:30 AM',
-        '3:30 PM',
-      ),
-      _bus(
-        19,
-        'BH3',
-        'Lalremruata',
-        '8259667788',
-        23.7305,
-        92.7205,
-        'idle',
-        today,
-        '9:30 AM',
-        '4:30 PM',
-      ),
-      _bus(
-        20,
-        'BH3',
-        'Thangmawia',
-        '9612778899',
-        23.7235,
-        92.7145,
-        'running',
-        today,
-        '10:00 AM',
-        '2:00 PM',
-      ),
-      _bus(
-        21,
-        'BH4',
-        'Kaptluanga',
-        '9862990011',
-        23.7320,
-        92.7220,
-        'idle',
-        today,
-        '8:45 AM',
-        '5:00 PM',
-      ),
-      _bus(
-        22,
-        'GH2',
-        'Saka',
-        '9378074359',
-        23.7245,
-        92.7152,
-        'running',
-        today,
-        '8:25 AM',
-        '5:30 PM',
-      ),
-    ];
-    if (hostelFilter != null) {
-      return allBuses
-          .where((b) => b['assignedHostel'] == hostelFilter)
-          .toList();
-    }
-    return allBuses;
-  }
-
-  Map<String, dynamic> _bus(
-    int num,
-    String hostel,
-    String driver,
-    String phone,
-    double lat,
-    double lng,
-    String status,
-    String date,
-    String fromHostel,
-    String fromMBSE, {
-    String note = '',
-  }) {
-    return {
-      'busNumber': num,
-      'assignedHostel': hostel,
-      'status': status,
-      'latitude': lat,
-      'longitude': lng,
-      'speed': status == 'running' ? 25.0 : 0.0,
-      'isEnabled': true,
-      'route': 'Hostel ↔ MBSE',
-      'driver': {
-        '_id': 'drv$num',
-        'name': driver,
-        'phone': phone,
-        'busNumber': num,
-        'isActive': true,
-      },
-      'schedule': {
-        '_id': 'sch$num',
-        'busNumber': num,
-        'date': date,
-        'fromHostelTime': fromHostel,
-        'fromMBSETime': fromMBSE,
-        'specialNote': note,
-        'updatedBy': 'admin@nitmz.ac.in',
-      },
-    };
-  }
-
-  List<Map<String, dynamic>> _getDemoSchedules(String? hostelFilter) {
-    return _getDemoBuses(
-      hostelFilter,
-    ).map((b) => b['schedule'] as Map<String, dynamic>).toList();
-  }
-
-  List<Map<String, dynamic>> _getDemoNotifications() {
-    return [
-      {
-        '_id': 'n1',
-        'title': 'Bus 5 Departure Alert',
-        'message': 'Bus 5 will depart from BH1 at 8:15 AM. Please be ready!',
-        'type': 'departure',
-        'busNumber': 5,
-        'targetHostel': 'BH1',
-        'sentAt': DateTime.now()
-            .subtract(const Duration(minutes: 30))
-            .toIso8601String(),
-        'isRead': false,
-      },
-      {
-        '_id': 'n2',
-        'title': 'Bus 7 Schedule Update',
-        'message':
-            'Bus 7 schedule updated. From Hostel: 8:15 PM, From MBSE: 5:30 PM',
-        'type': 'general',
-        'busNumber': 7,
-        'targetHostel': 'BH1',
-        'sentAt': DateTime.now()
-            .subtract(const Duration(hours: 2))
-            .toIso8601String(),
-        'isRead': false,
-      },
-      {
-        '_id': 'n3',
-        'title': 'Bus 2 Arriving Soon',
-        'message': 'Bus 2 (GH1) is 1 km away from hostel. ETA: 5 minutes!',
-        'type': 'arrival',
-        'busNumber': 2,
-        'targetHostel': 'GH1',
-        'sentAt': DateTime.now()
-            .subtract(const Duration(hours: 3))
-            .toIso8601String(),
-        'isRead': true,
-      },
-      {
-        '_id': 'n4',
-        'title': 'Bus 9 Maintenance',
-        'message':
-            'Bus 9 is under maintenance today. Please use alternate buses.',
-        'type': 'delay',
-        'busNumber': 9,
-        'targetHostel': 'BH1',
-        'sentAt': DateTime.now()
-            .subtract(const Duration(hours: 5))
-            .toIso8601String(),
-        'isRead': true,
-      },
-    ];
   }
 }
