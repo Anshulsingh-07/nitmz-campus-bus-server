@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const EventEmitter = require('events');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
+const { campusDateKey, isDateOnly, matchesCampusDate } = require('./campus_time');
 require('dotenv').config();
 
 if (process.env.NODE_ENV === 'production' && !process.env.API_SECRET_KEY) {
@@ -33,6 +34,8 @@ let pool;
 const hostelsSeed = [
     { id: 'GH1', name: 'GH1', type: 'Girls', fullName: "Girls' Hostel 1" },
     { id: 'GH2', name: 'GH2', type: 'Girls', fullName: "Girls' Hostel 2" },
+    { id: 'GH3', name: 'GH3', type: 'Girls', fullName: "Girls' Hostel 3" },
+    { id: 'GH4', name: 'GH4', type: 'Girls', fullName: "Girls' Hostel 4" },
     { id: 'BH1', name: 'BH1', type: 'Boys', fullName: "Boys' Hostel 1" },
     { id: 'BH2', name: 'BH2', type: 'Boys', fullName: "Boys' Hostel 2" },
     { id: 'BH3', name: 'BH3', type: 'Boys', fullName: "Boys' Hostel 3" },
@@ -73,15 +76,23 @@ const notificationsSeed = [
 
 const sessions = new Map();
 const driverLoginFailures = new Map();
-const passwordResetAttempts = new Map();
 const driverLastFixes = new Map();
 
-const today = () => new Date().toISOString().slice(0, 10);
+// Schedule calendar dates belong to the campus, whose civil timezone is IST.
+const today = () => campusDateKey(new Date());
 const uid = (prefix) => `${prefix}${crypto.randomBytes(6).toString('hex')}`;
 // Student roll IDs use the published example shape BT24CS034. The configured
 // account table currently contains caretaker identities only; see SECURITY_NOTES.md.
 const COLLEGE_STUDENT_EMAIL = /^bt\d{2}[a-z]{2}\d{3}@nitmz\.ac\.in$/i;
 
+app.use((req, res, next) => {
+    const startedAt = process.hrtime.bigint();
+    res.on('finish', () => {
+        const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+        console.info(`${req.method} ${req.path} ${res.statusCode} ${durationMs.toFixed(0)}ms`);
+    });
+    next();
+});
 app.use(express.json());
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -123,6 +134,18 @@ function mapSchedule(row) {
     };
 }
 
+function mapScheduleForToday(row) {
+    if (!row.schedule_id || !row.schedule_date) return null;
+    const todayKey = today();
+    const scheduleDate = row.schedule_date instanceof Date
+        ? campusDateKey(row.schedule_date)
+        : String(row.schedule_date).slice(0, 10);
+    if (!matchesCampusDate(scheduleDate, todayKey)) {
+        return null;
+    }
+    return mapSchedule(row);
+}
+
 function mapBus(row) {
     return {
         busNumber: row.bus_number,
@@ -146,7 +169,7 @@ function mapBus(row) {
                 isActive: !!row.driver_is_active,
             }
             : null,
-        schedule: mapSchedule(row),
+        schedule: mapScheduleForToday(row),
     };
 }
 
@@ -391,6 +414,34 @@ CREATE TABLE IF NOT EXISTS drivers (
     await q('ALTER TABLE drivers ADD COLUMN IF NOT EXISTS pin_hash VARCHAR(100) NULL');
     await q('DROP INDEX IF EXISTS drivers_active_phone_unique');
     await q(`
+CREATE TABLE IF NOT EXISTS schedules (
+  id VARCHAR(40) PRIMARY KEY,
+  bus_number INT NOT NULL REFERENCES buses(bus_number) ON DELETE CASCADE,
+  date DATE NOT NULL,
+  from_hostel_time VARCHAR(20) NOT NULL,
+  from_mbse_time VARCHAR(20) NOT NULL,
+  special_note VARCHAR(255) NULL,
+  updated_by VARCHAR(120) NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (bus_number, date)
+);
+`);
+    const scheduleDateType = await q(`SELECT data_type FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'schedules' AND column_name = 'date'`);
+    if (scheduleDateType.length && scheduleDateType[0].data_type !== 'date') {
+        // Legacy timestamp values are converted to their IST calendar date. A UTC-midnight
+        // value and an IST-midnight instant therefore both retain the intended civil day.
+        const dateExpression = scheduleDateType[0].data_type === 'timestamp with time zone'
+            ? `(date AT TIME ZONE 'Asia/Kolkata')::date`
+            : 'date::date';
+        const collisions = await q(`SELECT bus_number, ${dateExpression} AS normalized_date
+            FROM schedules GROUP BY bus_number, ${dateExpression} HAVING COUNT(*) > 1 LIMIT 1`);
+        if (collisions.length) {
+            throw new Error('Schedule date migration found multiple records for one bus and IST date; resolve these rows before converting the legacy timestamp column');
+        }
+        await q(`ALTER TABLE schedules ALTER COLUMN date TYPE DATE USING ${dateExpression}`);
+    }
+    await q(`
 CREATE TABLE IF NOT EXISTS notifications (
   id VARCHAR(40) PRIMARY KEY,
   title VARCHAR(160) NOT NULL,
@@ -399,11 +450,30 @@ CREATE TABLE IF NOT EXISTS notifications (
   bus_number INT NULL,
   target_hostel VARCHAR(10) NULL,
   sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '30 days'),
   is_read BOOLEAN NOT NULL DEFAULT false,
   sent_by VARCHAR(120) NULL,
   FOREIGN KEY (target_hostel) REFERENCES hostels(id) ON DELETE SET NULL
 );
 `);
+    await q(`
+CREATE TABLE IF NOT EXISTS reports (
+  id VARCHAR(40) PRIMARY KEY,
+  reporter_id VARCHAR(40) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  hostel_id VARCHAR(10) NOT NULL REFERENCES hostels(id),
+  bus_number INT NULL REFERENCES buses(bus_number) ON DELETE SET NULL,
+  category VARCHAR(40) NOT NULL,
+  message TEXT NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'open',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+`);
+    await q('CREATE INDEX IF NOT EXISTS reports_hostel_created_idx ON reports (hostel_id, created_at DESC)');
+    await q('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP');
+    await q("UPDATE notifications SET expires_at = sent_at + INTERVAL '30 days' WHERE expires_at IS NULL");
+    await q("ALTER TABLE notifications ALTER COLUMN expires_at SET DEFAULT (CURRENT_TIMESTAMP + INTERVAL '30 days')");
+    await q('ALTER TABLE notifications ALTER COLUMN expires_at SET NOT NULL');
+    await q('CREATE INDEX IF NOT EXISTS notifications_expires_at_idx ON notifications (expires_at)');
 
     await q(`
 CREATE TABLE IF NOT EXISTS telemetry (
@@ -426,17 +496,13 @@ CREATE TABLE IF NOT EXISTS telemetry (
     await q("ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS net_type VARCHAR(20) DEFAULT 'unknown'");
     await q('ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS heading NUMERIC(6,2) NOT NULL DEFAULT 0');
 
-    const [hostelCountRow] = await q('SELECT COUNT(*) AS count FROM hostels');
-    const hostelCount = hostelCountRow ? Number(hostelCountRow.count) : 0;
-    if (hostelCount === 0) {
-        for (const hostel of hostelsSeed) {
-            await q('INSERT INTO hostels (id, name, type, full_name) VALUES ($1, $2, $3, $4)', [
-                hostel.id,
-                hostel.name,
-                hostel.type,
-                hostel.fullName,
-            ]);
-        }
+    for (const hostel of hostelsSeed) {
+        await q('INSERT INTO hostels (id, name, type, full_name) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING', [
+            hostel.id,
+            hostel.name,
+            hostel.type,
+            hostel.fullName,
+        ]);
     }
 
     const [busCountRow] = await q('SELECT COUNT(*) AS count FROM buses');
@@ -484,12 +550,22 @@ app.get('/api', (_req, res) => {
 
 app.get('/api/health', async (_req, res) => {
     try {
+        const serverTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'unknown';
+        const serverTimeUtc = new Date().toISOString();
         const [[hostels], [buses], [notifications]] = await Promise.all([
             q('SELECT COUNT(*) AS count FROM hostels'),
             q('SELECT COUNT(*) AS count FROM buses'),
             q('SELECT COUNT(*) AS count FROM notifications'),
         ]);
-        res.json({ status: 'ok', hostels: hostels.count, buses: buses.count, notifications: notifications.count });
+        res.json({
+            status: 'ok',
+            hostels: hostels.count,
+            buses: buses.count,
+            notifications: notifications.count,
+            serverTimeZone,
+            serverTimeUtc,
+            campusDate: today(),
+        });
     } catch (error) {
         console.error('Health database query failed:', error.message);
         res.status(500).json({ status: 'error', message: 'Database query failed' });
@@ -515,6 +591,15 @@ app.post('/api/auth/register', async (req, res) => {
         if (!COLLEGE_STUDENT_EMAIL.test(normalizedEmail)) {
             return res.status(400).json({ error: 'Use your college roll-number email, e.g. bt24cs034@nitmz.ac.in' });
         }
+        if (String(password).length < 9 || String(password).length > 128) {
+            return res.status(400).json({ error: 'Password must be between 9 and 128 characters' });
+        }
+        if (!String(name).trim() || String(name).trim().length > 100) {
+            return res.status(400).json({ error: 'Name must contain 1 to 100 characters' });
+        }
+        const selectedHostel = String(hostelId || '').trim().toUpperCase();
+        const validHostel = await q('SELECT id FROM hostels WHERE id = ? LIMIT 1', [selectedHostel]);
+        if (!validHostel.length) return res.status(400).json({ error: 'Select a valid hostel' });
 
         const existing = await q('SELECT id FROM users WHERE LOWER(email) = LOWER(?)', [normalizedEmail]);
         if (existing.length > 0) {
@@ -530,7 +615,7 @@ app.post('/api/auth/register', async (req, res) => {
             // Public registration can only create student accounts. Caretakers
             // must be provisioned through a trusted administrative process.
             role: 'student',
-            hostel_id: hostelId || 'BH1',
+            hostel_id: selectedHostel,
         };
 
         await q(
@@ -792,45 +877,18 @@ app.get('/api/telemetry/history', async (req, res) => {
     }
 });
 
-app.post('/api/auth/forgot-password', async (req, res) => {
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    if (!email || email.length > 254) {
-        return res.status(400).json({ error: 'Enter a valid email address' });
-    }
-
-    const now = Date.now();
-    const windowMs = 60 * 60 * 1000;
-    const recentAttempts = (passwordResetAttempts.get(email) || []).filter((time) => now - time < windowMs);
-    if (recentAttempts.length >= 5) {
-        passwordResetAttempts.set(email, recentAttempts);
-        return res.status(429).json({ error: 'Too many reset attempts. Try again later.' });
-    }
-    recentAttempts.push(now);
-    passwordResetAttempts.set(email, recentAttempts);
-
-    try {
-        const rows = await q('SELECT id, email, role FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
-        if (rows.length) {
-            const localPart = rows[0].email.split('@')[0];
-            const defaultPassword = localPart.slice(0, 9);
-            const passwordHash = await bcrypt.hash(defaultPassword, 12);
-            await q('UPDATE users SET password = ?, must_change_password = true WHERE id = ?', [passwordHash, rows[0].id]);
-            for (const [token, session] of sessions) {
-                if (session.userId === rows[0].id) sessions.delete(token);
-            }
-        }
-        return res.json({ message: 'If this account exists, its temporary password is the first 9 characters of the email before @. You must change it after signing in.' });
-    } catch (error) {
-        return res.status(500).json({ error: 'Password reset is temporarily unavailable' });
-    }
+app.post('/api/auth/forgot-password', (_req, res) => {
+    return res.status(503).json({
+        error: 'Password reset is unavailable until verified email delivery is configured. Contact an administrator.',
+    });
 });
 
 app.post('/api/auth/change-password', async (req, res) => {
     const auth = requireAuth(req, res);
     if (!auth) return;
     const newPassword = String(req.body?.newPassword || '');
-    if (newPassword.length < 8 || newPassword.length > 128) {
-        return res.status(400).json({ error: 'Choose a password between 8 and 128 characters' });
+    if (newPassword.length < 9 || newPassword.length > 128) {
+        return res.status(400).json({ error: 'Choose a password between 9 and 128 characters' });
     }
     try {
         const passwordHash = await bcrypt.hash(newPassword, 12);
@@ -937,12 +995,7 @@ app.get('/api/buses', async (req, res) => {
 
     try {
         if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
-        const hostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : (req.query.hostel || null);
-        if (auth.role === 'student' && auth.hostelId && hostel && hostel !== auth.hostelId) {
-            return res.status(403).json({ error: 'Students can only view their own hostel buses' });
-        }
-
-        const targetHostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : hostel;
+        const targetHostel = auth.role === 'caretaker' ? auth.hostelId : (req.query.hostel || null);
         const where = targetHostel ? 'WHERE b.assigned_hostel = ?' : '';
         const rows = await q(`${BUS_SELECT} ${where} ORDER BY b.bus_number`, targetHostel ? [targetHostel] : []);
         return res.json(rows.map(mapBus));
@@ -957,7 +1010,7 @@ app.get('/api/all-buses', async (req, res) => {
 
     try {
         if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
-        const hostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : (req.query.hostel || null);
+        const hostel = auth.role === 'caretaker' ? auth.hostelId : (req.query.hostel || null);
         const where = hostel ? 'WHERE b.assigned_hostel = ?' : '';
         const rows = await q(`${BUS_SELECT} ${where} ORDER BY b.bus_number`, hostel ? [hostel] : []);
         return res.json({ status: 'success', data: rows.map(mapBus) });
@@ -970,7 +1023,7 @@ app.get('/api/today-buses', async (req, res) => {
     const auth = requireAuth(req, res, ['student', 'caretaker', 'admin', 'driver']);
     if (!auth) return;
     const date = String(req.query.date || today());
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    if (!isDateOnly(date)) {
         return res.status(400).json({ error: 'date must use YYYY-MM-DD format' });
     }
     try {
@@ -1007,9 +1060,6 @@ app.get('/api/buses/:busNumber', async (req, res) => {
     try {
         const bus = await fetchBusByNumber(req.params.busNumber);
         if (!bus) return res.status(404).json({ error: 'Bus not found' });
-        if (auth.role === 'student' && auth.hostelId !== bus.assignedHostel) {
-            return res.status(403).json({ error: 'Access denied' });
-        }
         if (auth.role === 'caretaker' && (!auth.hostelId || auth.hostelId !== bus.assignedHostel)) {
             return res.status(403).json({ error: 'Caretaker can only view own hostel buses' });
         }
@@ -1130,8 +1180,11 @@ app.get('/api/schedules', async (req, res) => {
 
     try {
         if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
-        const hostel = ['student', 'caretaker'].includes(auth.role) ? auth.hostelId : (req.query.hostel || null);
+        const hostel = auth.role === 'caretaker' ? auth.hostelId : (req.query.hostel || null);
         const date = req.query.date || null;
+        if (date !== null && !isDateOnly(String(date))) {
+            return res.status(400).json({ error: 'date must be a valid YYYY-MM-DD campus date' });
+        }
 
         const rows = await q(
             `
@@ -1174,9 +1227,18 @@ app.post('/api/schedules', async (req, res) => {
         }
 
         const scheduleDate = req.body.date || today();
+        if (!isDateOnly(scheduleDate)) {
+            return res.status(400).json({ error: 'date must be a valid YYYY-MM-DD campus date' });
+        }
         const fromHostelTime = req.body.fromHostelTime || '';
         const fromMBSETime = req.body.fromMBSETime || '';
         const specialNote = req.body.specialNote || '';
+
+        // Notifications target the hostel on the bus record, never a client-supplied recipient.
+        const priorRows = await q('SELECT from_hostel_time, from_mbse_time FROM schedules WHERE bus_number = ? AND date = ? LIMIT 1', [busNumber, scheduleDate]);
+        const scheduleChanged = priorRows.length === 0 ||
+            priorRows[0].from_hostel_time !== fromHostelTime ||
+            priorRows[0].from_mbse_time !== fromMBSETime;
 
                 await q(
                         `
@@ -1199,6 +1261,17 @@ app.post('/api/schedules', async (req, res) => {
                                 auth.email,
                         ]
                 );
+
+        if (scheduleChanged) {
+            const bus = await q('SELECT assigned_hostel FROM buses WHERE bus_number = ? LIMIT 1', [busNumber]);
+            if (bus.length) {
+                await q('INSERT INTO notifications (id, title, message, type, bus_number, target_hostel, is_read, sent_by) VALUES (?, ?, ?, ?, ?, ?, false, ?)', [
+                    uid('n_'), `Bus ${busNumber} Schedule Updated`,
+                    `Bus ${busNumber} ${bus[0].assigned_hostel} → MBSE schedule has changed to ${fromHostelTime || fromMBSETime}.`,
+                    'schedule', busNumber, bus[0].assigned_hostel, auth.email,
+                ]);
+            }
+        }
 
         if (req.body.status) {
             const status = String(req.body.status).toLowerCase();
@@ -1318,9 +1391,11 @@ app.get('/api/notifications', async (req, res) => {
                 bus_number AS busNumber,
                 target_hostel AS targetHostel,
                 to_char(sent_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS sentAt,
+                                to_char(expires_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS expiresAt,
                 is_read AS isRead
             FROM notifications
-            WHERE ($1 IS NULL OR target_hostel = $1 OR target_hostel IS NULL)
+                        WHERE expires_at > CURRENT_TIMESTAMP
+                            AND ($1 IS NULL OR target_hostel = $1 OR target_hostel IS NULL)
             ORDER BY sent_at DESC
       `,
                         [hostel]
@@ -1328,6 +1403,64 @@ app.get('/api/notifications', async (req, res) => {
         return res.json(rows.map((n) => ({ ...n, isRead: !!n.isRead })));
     } catch (error) {
         return res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/reports', async (req, res) => {
+    const auth = requireAuth(req, res, ['student']);
+    if (!auth) return;
+    const category = String(req.body?.category || 'other').trim();
+    const message = String(req.body?.message || '').trim();
+    const busNumber = req.body?.busNumber == null ? null : Number(req.body.busNumber);
+    if (!message || message.length > 2000 || category.length > 40) {
+        return res.status(400).json({ error: 'A report message up to 2000 characters is required' });
+    }
+    if (!auth.hostelId) return res.status(403).json({ error: 'Student account has no assigned hostel' });
+    try {
+        if (busNumber != null) {
+            if (!Number.isInteger(busNumber)) return res.status(400).json({ error: 'busNumber must be an integer' });
+            const bus = await q('SELECT bus_number FROM buses WHERE bus_number = ? LIMIT 1', [busNumber]);
+            if (!bus.length) return res.status(404).json({ error: 'Bus not found' });
+        }
+        const rows = await q(`INSERT INTO reports (id, reporter_id, hostel_id, bus_number, category, message)
+            VALUES (?, ?, ?, ?, ?, ?) RETURNING id, reporter_id AS "reporterId", hostel_id AS "hostelId",
+            bus_number AS "busNumber", category, message, status, created_at AS "createdAt"`,
+        [uid('r_'), auth.userId, auth.hostelId, busNumber, category || 'other', message]);
+        return res.status(201).json({ status: 'success', data: rows[0] });
+    } catch (error) {
+        return res.status(500).json({ error: 'Could not submit report' });
+    }
+});
+
+app.get('/api/reports', async (req, res) => {
+    const auth = requireAuth(req, res, ['student', 'caretaker', 'admin']);
+    if (!auth) return;
+    try {
+        const scope = auth.role === 'caretaker' ? 'WHERE r.hostel_id = $1'
+            : auth.role === 'student' ? 'WHERE r.reporter_id = $1' : '';
+        const args = auth.role === 'caretaker' ? [auth.hostelId || ''] : auth.role === 'student' ? [auth.userId] : [];
+        const rows = await pool.query(`SELECT r.id, r.reporter_id AS "reporterId", r.hostel_id AS "hostelId",
+            r.bus_number AS "busNumber", r.category, r.message, r.status, r.created_at AS "createdAt"
+            FROM reports r ${scope} ORDER BY r.created_at DESC`, args);
+        return res.json({ status: 'success', data: rows.rows });
+    } catch (error) {
+        return res.status(500).json({ error: 'Could not load reports' });
+    }
+});
+
+app.patch('/api/reports/:id', async (req, res) => {
+    const auth = requireAuth(req, res, ['caretaker', 'admin']);
+    if (!auth) return;
+    const status = String(req.body?.status || '').toLowerCase();
+    if (!['open', 'in_progress', 'resolved'].includes(status)) return res.status(400).json({ error: 'Invalid report status' });
+    try {
+        const args = [status, req.params.id];
+        const scope = auth.role === 'caretaker' ? ' AND hostel_id = $3' : '';
+        if (auth.role === 'caretaker') args.push(auth.hostelId || '');
+        const result = await pool.query(`UPDATE reports SET status = $1 WHERE id = $2${scope} RETURNING id`, args);
+        return result.rowCount ? res.json({ status: 'success' }) : res.status(404).json({ error: 'Report not found' });
+    } catch (error) {
+        return res.status(500).json({ error: 'Could not update report' });
     }
 });
 
@@ -1371,6 +1504,7 @@ app.post('/api/notifications/send', async (req, res) => {
                 bus_number AS busNumber,
                 target_hostel AS targetHostel,
                 to_char(sent_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS sentAt,
+                to_char(expires_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS expiresAt,
                 is_read AS isRead
             FROM notifications
             WHERE id = $1
@@ -1503,6 +1637,10 @@ app.post('/api/update-location', async (req, res) => {
         }
 
         const normalizedStatus = telemetry.status === 'active' ? 'running' : telemetry.status;
+        const eventTime = telemetry.timestamp == null ? new Date() : new Date(telemetry.timestamp);
+        if (Number.isNaN(eventTime.getTime()) || eventTime.getTime() > Date.now() + 5 * 60 * 1000) {
+            return res.status(400).json({ error: 'timestamp must be a valid ISO date and cannot be in the future' });
+        }
         const busNumber = Number(String(telemetry.busId || '').replace(/[^0-9]/g, ''));
         if (!Number.isInteger(busNumber) || busNumber <= 0) {
             console.warn('Telemetry validation failed', { busId: telemetry.busId, reason: 'invalid_bus_id' });
@@ -1514,12 +1652,18 @@ app.post('/api/update-location', async (req, res) => {
             return res.status(404).json({ error: 'Bus not registered or disabled' });
         }
 
+        const priorFix = await q('SELECT ts FROM telemetry WHERE regexp_replace(bus_id, \'[^0-9]\', \'\', \'g\') = ? ORDER BY received_at DESC, id DESC LIMIT 1', [String(busNumber)]);
+        const priorEventTime = priorFix.length ? Date.parse(priorFix[0].ts || '') : NaN;
+        if (Number.isFinite(priorEventTime) && eventTime.getTime() <= priorEventTime) {
+            return res.status(200).json({ message: 'Older telemetry ignored', status: 'success', stale: true });
+        }
+
         const client = await pool.connect();
         try {
             await client.query('BEGIN');
             await client.query(
                 'INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, has_fix, satellites, hdop, net_type, ts, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)',
-                [telemetry.deviceId, telemetry.busId, latNum, lngNum, speedNum, accuracyNum, telemetry.hasFix ?? true, telemetry.satellites, telemetry.hdop, telemetry.netType, telemetry.timestamp || new Date().toISOString(), normalizedStatus]
+                [telemetry.deviceId, telemetry.busId, latNum, lngNum, speedNum, accuracyNum, telemetry.hasFix ?? true, telemetry.satellites, telemetry.hdop, telemetry.netType, eventTime.toISOString(), normalizedStatus]
             );
             await client.query('UPDATE buses SET latitude = $1, longitude = $2, speed = $3, status = $4 WHERE bus_number = $5', [latNum, lngNum, speedNum, normalizedStatus, busNumber]);
             await client.query('COMMIT');
@@ -1543,7 +1687,7 @@ app.post('/api/update-location', async (req, res) => {
             satellites: telemetry.satellites,
             hdop: telemetry.hdop,
             netType: telemetry.netType,
-            timestamp: telemetry.timestamp || new Date().toISOString(),
+            timestamp: eventTime.toISOString(),
         });
 
         return res.status(200).json({ message: 'Data received successfully', status: 'success' });
@@ -1580,6 +1724,9 @@ app.get('/api/location/latest', async (_req, res) => {
         }
 
         const latest = rows[0];
+        const deviceTime = latest.ts ? new Date(latest.ts) : null;
+        const validDeviceTime = deviceTime && !Number.isNaN(deviceTime.getTime()) && deviceTime.getTime() <= Date.now() + 5 * 60 * 1000;
+        const eventTimestamp = validDeviceTime ? deviceTime.toISOString() : new Date(latest.received_at).toISOString();
         const busRaw = latest.bus_id || '5';
         const busDigits = String(busRaw).replace(/[^0-9]/g, '');
         const busId = busDigits ? `Bus ${busDigits}` : String(busRaw);
@@ -1601,9 +1748,9 @@ app.get('/api/location/latest', async (_req, res) => {
                 lng: Number(latest.lng),
                 speed: Number(latest.speed || 0),
                 accuracy: Number(latest.accuracy || 1.0),
-                // Use database receipt time for freshness; device clocks are
-                // exposed separately and cannot make a newly received fix stale.
-                timestamp: latest.received_at,
+                // Preserve the normalized device fix time so clients can mark
+                // delayed/replayed telemetry stale. Receipt time is available separately.
+                timestamp: eventTimestamp,
                 deviceTimestamp: latest.ts,
                 receivedAt: latest.received_at,
                 status: latest.status || 'idle',
@@ -1616,15 +1763,25 @@ app.get('/api/location/latest', async (_req, res) => {
 });
 
 app.post('/update-gps', async (req, res) => {
+    if (!API_SECRET_KEY) {
+        return res.status(503).json({ error: 'Telemetry ingestion is not configured' });
+    }
+    if (req.header('x-api-key') !== API_SECRET_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     try {
         const { lat, lng } = req.body || {};
-        if (lat === undefined || lng === undefined) {
-            return res.status(400).json({ status: 'Error', message: 'Invalid Data' });
+        const latitude = Number(lat);
+        const longitude = Number(lng);
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+            Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+            return res.status(400).json({ error: 'Valid latitude and longitude are required' });
         }
 
         await q(
             'INSERT INTO telemetry (device_id, bus_id, lat, lng, speed, accuracy, ts, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            ['ESP32-legacy', null, Number(lat), Number(lng), 0, 1.0, null, 'idle']
+            ['ESP32-legacy', null, latitude, longitude, 0, 1.0, null, 'idle']
         );
 
         return res.status(200).json({ status: 'Success', message: 'Location Updated' });
@@ -1659,7 +1816,11 @@ app.use((req, res) => {
 
 app.use((error, _req, res, _next) => {
     console.error('Unhandled request error:', error.message);
-    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+    if (res.headersSent) return;
+    if (error.type === 'entity.parse.failed') {
+        return res.status(400).json({ error: 'Invalid JSON request body' });
+    }
+    return res.status(500).json({ error: 'Internal server error' });
 });
 
 async function start() {
